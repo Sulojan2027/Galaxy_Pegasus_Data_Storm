@@ -1,5 +1,4 @@
 # Ignore Data
-data/
 *.csv
 *.parquet
 
