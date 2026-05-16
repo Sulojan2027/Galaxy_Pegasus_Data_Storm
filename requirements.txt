@@ -1,0 +1,24 @@
+# Core data stack
+pandas>=2.1
+numpy>=1.26
+pyarrow>=14.0
+scipy>=1.11
+
+# Modeling
+scikit-learn>=1.4
+statsmodels>=0.14
+
+# Geospatial / POI scraping
+requests>=2.31
+geopy>=2.4
+shapely>=2.0
+
+# Notebooks & viz
+jupyter>=1.0
+matplotlib>=3.8
+seaborn>=0.13
+
+# Utilities
+pyyaml>=6.0
+tqdm>=4.66
+python-dateutil>=2.8
