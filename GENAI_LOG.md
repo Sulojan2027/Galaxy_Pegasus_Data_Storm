@@ -31,10 +31,38 @@ deliverable in the brief and is updated in real time as work progresses.
   against the actual CSVs and corrected the canonical-alias map twice.
 
 ### Phase B — Data forensics
-- _to be filled as work progresses._
+- Used **Claude (Cursor)** to run a structured inspection of the 5 raw CSVs,
+  cataloguing every schema delta versus our initial assumption. AI proposed
+  the dirty-data inventory; we verified each finding interactively in a
+  Python shell before adding a corresponding DQ check.
+- Caught and documented:
+  - **200 outlets with lat/lon swapped** (auto-fixed by `coord_swap_fix`).
+  - **40 outlets with (0,0) default coordinates** (rejected via bbox check).
+  - **32,240 duplicate transaction rows** on the natural composite key.
+  - **4,753 negative volumes** (~0.2%) — kept as tagged returns/credits.
+  - **Outlet_Type typos** (`Grocry`, `Bakry`, ` Eatery `, `SMMT`) normalized.
+  - **Outlet_Size casing** (`small` vs `Small`) normalized.
+  - **Categorical `Seasonality_Index`** (Favorable/Moderate/Un-Favorable)
+    converted to numeric multiplier {1.15, 1.00, 0.85}.
+  - **Distributor_ID, Province absent from outlet_master** — derived from
+    transactions (primary distributor per outlet) and ID-prefix rules.
+  - **Holidays PK** corrected from `(date, name)` to `(date, name, type)`
+    after discovering legitimate multi-type rows (e.g. Vesak Poya Day is
+    Public + Poya Day + Bank + Mercantile).
 
 ### Phase C — DQ framework
-- _to be filled as work progresses._
+- AI proposed the registry-based check engine; we kept it but tightened
+  the contract: every check returns `(passing, rejected_with_reason)` and
+  rejected rows MUST land in `_rejected/` with a non-empty `failure_reason`.
+- **AI suggestion rejected:** an initial `low_volume_month_tag` check was
+  applied at *transaction-line* grain, producing 63% false-positive
+  constraint rate (each transaction line is a single SKU within a month,
+  so per-line quantiles are meaningless). We removed it from the DQ pipeline
+  and reimplemented monthly-grain constraint flagging inside Gold.
+- **AI suggestion rejected:** an early `soft_ceiling_flag` flagged months
+  within 20% of the outlet's own max as "constrained" — at monthly grain
+  this is the OPPOSITE of what we want (those are exactly the unconstrained
+  months that reveal latent demand). Removed.
 
 ### Phase D — POI scraping
 - **Used Claude (Cursor)** to draft Overpass QL query templates for each POI

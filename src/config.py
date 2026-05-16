@@ -1,11 +1,8 @@
 """Project-wide configuration.
 
-Centralizes paths, schema contracts, primary keys, and DQ thresholds so that
-every layer of the pipeline reads from a single source of truth.
-
-If the raw CSV column names differ from what is declared here, update the
-`SCHEMAS` block below; the rest of the pipeline is column-name driven and
-will adapt.
+Single source of truth for paths, schema contracts, primary keys, DQ
+thresholds, and business constants. Updated to match the actual
+Data Storm v7.0 file schemas after inspection.
 """
 
 from __future__ import annotations
@@ -27,34 +24,27 @@ GOLD_DIR = DATA_DIR / "gold"
 EXTERNAL_DIR = DATA_DIR / "external"
 POI_CACHE_DIR = EXTERNAL_DIR / "poi"
 PREDICTIONS_DIR = DATA_DIR / "predictions"
-RAW_INPUT_DIR = DATA_DIR / "raw"  # where the user drops the original CSVs
+RAW_INPUT_DIR = DATA_DIR / "raw"
 
 for _p in (
-    BRONZE_DIR,
-    SILVER_DIR,
-    REJECTED_DIR,
-    GOLD_DIR,
-    EXTERNAL_DIR,
-    POI_CACHE_DIR,
-    PREDICTIONS_DIR,
-    RAW_INPUT_DIR,
+    BRONZE_DIR, SILVER_DIR, REJECTED_DIR, GOLD_DIR,
+    EXTERNAL_DIR, POI_CACHE_DIR, PREDICTIONS_DIR, RAW_INPUT_DIR,
 ):
     _p.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
-# Source file mapping (rename if your CSVs are named differently)
+# Source file mapping
 # ---------------------------------------------------------------------------
 SOURCE_FILES: dict[str, str] = {
     "transactions": "transactions_history_final.csv",
-    "outlets": "outlet_master.csv",
-    "seasonality": "distributor_seasonality_details.csv",
-    "holidays": "holiday_list.csv",
+    "outlets":      "outlet_master.csv",
+    "coordinates":  "outlet_coordinates.csv",
+    "seasonality":  "distributor_seasonality_details.csv",
+    "holidays":     "holiday_list.csv",
 }
 
 # ---------------------------------------------------------------------------
 # Schema contracts
-# These are the *expected* canonical column names. Adjust the `aliases` dict
-# in `normalize_columns()` (utils/io.py) if your raw files differ.
 # ---------------------------------------------------------------------------
 
 
@@ -66,43 +56,51 @@ class DatasetSchema:
     numeric_ranges: dict[str, tuple[float, float]] = field(default_factory=dict)
     date_cols: list[str] = field(default_factory=list)
     foreign_keys: dict[str, tuple[str, str]] = field(default_factory=dict)
-    # foreign_keys: {local_col: (ref_dataset_name, ref_col)}
 
 
 SCHEMAS: dict[str, DatasetSchema] = {
     "transactions": DatasetSchema(
         name="transactions",
-        primary_key=["transaction_id"],
-        mandatory_cols=["outlet_id", "distributor_id", "date", "volume_liters"],
-        numeric_ranges={"volume_liters": (0.0, 50_000.0)},
-        date_cols=["date"],
-        foreign_keys={
-            "outlet_id": ("outlets", "outlet_id"),
-            "distributor_id": ("outlets", "distributor_id"),
+        primary_key=["outlet_id", "year", "month", "distributor_id", "sku_id"],
+        mandatory_cols=[
+            "outlet_id", "year", "month", "distributor_id", "sku_id",
+            "volume_liters", "total_bill_value",
+        ],
+        # Note: Volume_Liters can be negative (returns/credits). We TAG these
+        # via a custom check rather than rejecting via value_range.
+        numeric_ranges={
+            "year": (2022, 2026),
+            "month": (1, 12),
         },
     ),
     "outlets": DatasetSchema(
         name="outlets",
         primary_key=["outlet_id"],
-        mandatory_cols=["outlet_id", "distributor_id", "province"],
+        mandatory_cols=["outlet_id", "outlet_type"],
+        numeric_ranges={"cooler_count": (0, 100)},
+    ),
+    "coordinates": DatasetSchema(
+        name="coordinates",
+        primary_key=["outlet_id"],
+        mandatory_cols=["outlet_id", "latitude", "longitude"],
         numeric_ranges={
-            "latitude": (5.5, 10.5),   # Sri Lanka bounding box
+            "latitude": (5.5, 10.5),    # Sri Lanka bounding box
             "longitude": (79.0, 82.5),
         },
-        date_cols=[],
     ),
     "seasonality": DatasetSchema(
         name="seasonality",
-        primary_key=["distributor_id", "month"],
-        mandatory_cols=["distributor_id", "month", "seasonality_index"],
-        numeric_ranges={"seasonality_index": (0.0, 5.0), "month": (1, 12)},
-        date_cols=[],
+        primary_key=["distributor_id", "year", "month"],
+        mandatory_cols=["distributor_id", "year", "month", "seasonality_index"],
+        numeric_ranges={"year": (2022, 2026), "month": (1, 12)},
     ),
     "holidays": DatasetSchema(
         name="holidays",
-        primary_key=["date", "holiday_name"],
-        mandatory_cols=["date", "holiday_name"],
-        numeric_ranges={},
+        # A single holiday legitimately gets multiple Holiday_Type rows
+        # (e.g. Vesak Poya Day is both Public AND Poya Day). The natural PK
+        # is the full triple.
+        primary_key=["date", "holiday_name", "holiday_type"],
+        mandatory_cols=["date", "holiday_name", "holiday_type"],
         date_cols=["date"],
     ),
 }
@@ -110,9 +108,12 @@ SCHEMAS: dict[str, DatasetSchema] = {
 # ---------------------------------------------------------------------------
 # Business / domain constants
 # ---------------------------------------------------------------------------
-TARGET_MONTH = "2026-01"        # The month we predict potential for
-TARGET_MONTH_INT = 1            # January
-EXPECTED_OUTLET_COUNT = 20_000  # Per the brief
+TARGET_MONTH_INT = 1            # January 2026
+TARGET_MONTH_YEAR = 2026
+TARGET_MONTH_LABEL = "2026-01"
+SEASONALITY_FALLBACK_YEAR = 2025  # seasonality data covers 2023..2025; 2026 not present
+
+EXPECTED_OUTLET_COUNT = 20_000
 EXPECTED_DISTRIBUTORS = [
     "DIST_W_01", "DIST_W_02", "DIST_W_03",
     "DIST_C_01", "DIST_C_02", "DIST_C_03",
@@ -120,16 +121,57 @@ EXPECTED_DISTRIBUTORS = [
     "DIST_S_01", "DIST_S_02",
 ]
 EXPECTED_PROVINCES = ["Western", "Central", "North-Western", "Southern"]
+EXPECTED_SKUS = [f"SKU_{i:02d}" for i in range(1, 11)]
+
+# Map distributor-ID prefix → province (the master file lacks province).
+DISTRIBUTOR_PREFIX_TO_PROVINCE = {
+    "DIST_W_": "Western",
+    "DIST_C_": "Central",
+    "DIST_NW_": "North-Western",
+    "DIST_S_": "Southern",
+}
+
+# Categorical seasonality → multiplicative numeric index.
+# These three categories are the only values that appear in the data.
+# Values chosen to be (a) symmetric around 1.0 and (b) of plausible FMCG
+# magnitude (~±15% swing between favorable and un-favorable months).
+SEASONALITY_NUMERIC: dict[str, float] = {
+    "Favorable":    1.15,
+    "Moderate":     1.00,
+    "Un-Favorable": 0.85,
+}
+
+# Outlet attribute normalization: maps observed dirty values to canonical ones.
+OUTLET_TYPE_CANONICAL: dict[str, str] = {
+    "grocry": "Grocery",
+    "grocery": "Grocery",
+    "bakry": "Bakery",
+    "bakery": "Bakery",
+    "eatery": "Eatery",
+    "hotel": "Hotel",
+    "pharmacy": "Pharmacy",
+    "kiosk": "Kiosk",
+    "smmt": "Supermarket",   # best-guess interpretation
+}
+OUTLET_SIZE_CANONICAL: dict[str, str] = {
+    "small": "Small",
+    "medium": "Medium",
+    "large": "Large",
+    "extra large": "Extra Large",
+}
 
 # ---------------------------------------------------------------------------
 # Data quality thresholds
 # ---------------------------------------------------------------------------
 DQ_CONFIG: dict[str, Any] = {
-    "constant_run_min_days": 7,         # >=7 identical non-zero volumes flagged as suspicious
-    "blackout_distributor_threshold": 0.95,  # if 95%+ of a distributor's outlets are zero on a day
-    "round_number_suspicion_modulos": [50, 100, 500, 1000],  # credit-cap fingerprints
-    "duplicate_strict": True,           # if True, all dupes after first are rejected
-    "max_null_fraction": 0.30,          # if a mandatory col is >30% null we error out
+    "round_number_suspicion_modulos": [50, 100, 500, 1000],
+    "duplicate_strict": True,
+    "max_null_fraction": 0.30,
+    "coord_swap_autofix": True,    # try to swap lat/lon when one looks like the other
+    "negative_volume_tag_only": True,  # don't reject returns
+    "min_sku_diversity": 2,        # months with <2 SKUs flagged as constrained
+    "low_volume_quantile": 0.20,   # months below 20th percentile (per outlet) flagged
+    "near_max_share_threshold": 0.20,  # tightness near outlet's own max
 }
 
 # ---------------------------------------------------------------------------
@@ -141,9 +183,7 @@ POI_CONFIG: dict[str, Any] = {
     "request_timeout_s": 60,
     "max_retries": 4,
     "backoff_base_s": 5,
-    "batch_size": 25,                   # outlets per Overpass call
-    # POI categories considered demand drivers for beverages.
-    # Each entry is an Overpass tag filter snippet.
+    "batch_size": 25,
     "poi_taxonomy": {
         "school":      '["amenity"~"school|college|kindergarten"]',
         "university":  '["amenity"="university"]',
@@ -165,14 +205,14 @@ POI_CONFIG: dict[str, Any] = {
 # Modeling
 # ---------------------------------------------------------------------------
 MODEL_CONFIG: dict[str, Any] = {
-    "peer_cluster_count": 25,           # KMeans peer clusters
-    "peer_ceiling_quantile": 0.90,      # use 90th percentile of peer best-months
+    "peer_cluster_count": 25,
+    "peer_ceiling_quantile": 0.90,
     "quantile_regression_tau": 0.90,
-    "ensemble_weights": {               # final weighted blend
+    "ensemble_weights": {
         "peer_ceiling": 0.40,
         "quantile_regression": 0.30,
         "unconstrained_extrapolation": 0.30,
     },
-    "min_unconstrained_months": 2,      # below this, fall back to peer ceiling only
-    "potential_floor_multiplier": 1.0,  # potential must be >= historical max * this
+    "min_unconstrained_months": 2,
+    "potential_floor_multiplier": 1.0,
 }

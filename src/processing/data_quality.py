@@ -193,86 +193,116 @@ def check_format(
 # ---------------------------------------------------------------------------
 # Custom checks for FMCG / legacy SFA artifacts
 # ---------------------------------------------------------------------------
-@register("constant_run")
-def check_constant_runs(
+@register("coord_swap_fix")
+def check_coord_swap(
+    df: pd.DataFrame,
+    lat_col: str = "latitude",
+    lon_col: str = "longitude",
+    lat_bounds: tuple[float, float] = (5.5, 10.5),
+    lon_bounds: tuple[float, float] = (79.0, 82.5),
+    autofix: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Detect (and optionally auto-fix) outlet rows where Latitude and
+    Longitude have been swapped.
+
+    A row is treated as swapped when `latitude` falls inside the longitude
+    box AND `longitude` falls inside the latitude box. With `autofix=True`
+    the values are swapped in-place and the row remains in `passing` with
+    no quarantine. With `autofix=False` the row is rejected.
+
+    Rows that are out-of-bounds in BOTH coordinates (e.g. 0,0 default
+    placeholders) are not handled here — the standard `value_range` check
+    will catch them downstream.
+    """
+    if not {lat_col, lon_col}.issubset(df.columns):
+        return df, _tag_reason(df.iloc[0:0], "coord_swap:missing_cols")
+
+    lat = pd.to_numeric(df[lat_col], errors="coerce")
+    lon = pd.to_numeric(df[lon_col], errors="coerce")
+    swapped = (
+        lat.between(*lon_bounds) & lon.between(*lat_bounds)
+        & ~(lat.between(*lat_bounds) & lon.between(*lon_bounds))
+    )
+    if autofix:
+        out = df.copy()
+        out.loc[swapped, lat_col] = lon[swapped].values
+        out.loc[swapped, lon_col] = lat[swapped].values
+        n_fixed = int(swapped.sum())
+        if n_fixed:
+            logger.info("coord_swap: auto-fixed %d swapped lat/lon rows", n_fixed)
+        empty_rej = _tag_reason(df.iloc[0:0], f"coord_swap:autofixed n={n_fixed}")
+        return out, empty_rej
+    rejected = _tag_reason(df[swapped], "coord_swap")
+    return df[~swapped], rejected
+
+
+@register("text_normalize")
+def check_text_normalize(
+    df: pd.DataFrame,
+    col: str,
+    mapping: dict[str, str],
+    case_insensitive: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Trim + map common typos / casing variants to a canonical value.
+
+    This is a TAG-style fix, not a rejection. Values that fail to map to
+    anything (after lowercase + strip) pass through unchanged so the
+    referential-integrity-style checks downstream can flag them.
+    """
+    if col not in df.columns:
+        return df, _tag_reason(df.iloc[0:0], f"text_normalize:missing_col:{col}")
+
+    out = df.copy()
+    s = out[col].astype("string").str.strip()
+    if case_insensitive:
+        key = s.str.lower()
+    else:
+        key = s
+    mapped = key.map(mapping)
+    out[col] = mapped.fillna(s)
+    empty_rej = _tag_reason(df.iloc[0:0], f"text_normalize:{col}")
+    return out, empty_rej
+
+
+@register("negative_volume_tag")
+def check_negative_volume_tag(
+    df: pd.DataFrame,
+    value_col: str = "volume_liters",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Tag (don't reject) rows with negative volume as returns/credits.
+
+    Adds an `_is_return` boolean column. Modeling uses this to either
+    aggregate net volume (purchases − returns) or analyse return rates as
+    a feature.
+    """
+    if value_col not in df.columns:
+        return df, _tag_reason(df.iloc[0:0], "neg_vol:missing_col")
+    out = df.copy()
+    out["_is_return"] = pd.to_numeric(out[value_col], errors="coerce").lt(0).fillna(False)
+    return out, _tag_reason(df.iloc[0:0], "neg_vol:tagged")
+
+
+@register("low_volume_month_tag")
+def check_low_volume_month(
     df: pd.DataFrame,
     group_keys: list[str],
-    order_col: str,
-    value_col: str,
-    min_run: int = 7,
+    value_col: str = "volume_liters",
+    quantile: float = 0.20,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Flag suspicious runs of identical non-zero values per group.
+    """Tag months (rows) where an outlet's volume is unusually low vs its
+    own history — a stockout / route-skip proxy at monthly grain.
 
-    Catches "ghost entries" where the SFA app pre-fills the same volume across
-    consecutive days for the same outlet — a classic data-entry shortcut.
+    The modeling layer treats tagged months as candidates for "constrained"
+    classification rather than rejecting them.
     """
-    needed = set(group_keys + [order_col, value_col])
-    if not needed.issubset(df.columns):
-        return df, _tag_reason(df.iloc[0:0], "constant_run:missing_cols")
-
-    d = df.sort_values(group_keys + [order_col]).copy()
-    d["_v"] = pd.to_numeric(d[value_col], errors="coerce")
-    grp = d.groupby(group_keys, sort=False)
-    # mark rows where value equals previous value within group
-    d["_same"] = grp["_v"].transform(lambda s: s.eq(s.shift(1)))
-    # consecutive run id (resets when _same flips False)
-    d["_run_id"] = (~d["_same"].fillna(False)).cumsum()
-    d["_run_len"] = d.groupby("_run_id")["_v"].transform("size")
-    suspicious_mask = (
-        (d["_run_len"] >= min_run) & d["_v"].fillna(0).gt(0)
-    )
-    rejected_idx = d.index[suspicious_mask]
-    rejected = _tag_reason(
-        df.loc[rejected_idx],
-        f"constant_run>={min_run}:{value_col}",
-    )
-    passing = df.drop(index=rejected_idx)
-    return passing, rejected
-
-
-@register("distributor_blackout")
-def check_distributor_blackout(
-    df: pd.DataFrame,
-    distributor_col: str,
-    date_col: str,
-    outlet_col: str,
-    value_col: str,
-    blackout_threshold: float = 0.95,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Detect days where ~all outlets of a distributor record zero volume.
-
-    Almost always a connectivity blackout, route truck breakdown, or SFA sync
-    failure — not real demand collapse. We quarantine the affected rows so
-    they don't poison the "active days" denominator downstream.
-    """
-    needed = {distributor_col, date_col, outlet_col, value_col}
-    if not needed.issubset(df.columns):
-        return df, _tag_reason(df.iloc[0:0], "blackout:missing_cols")
-
-    d = df.copy()
-    d["_v"] = pd.to_numeric(d[value_col], errors="coerce").fillna(0)
-    # outlets-per-(distributor,date)
-    grp = d.groupby([distributor_col, date_col], dropna=False)
-    activity = grp.agg(
-        zero_rate=("_v", lambda s: float((s == 0).mean())),
-        outlets=(outlet_col, "nunique"),
-    ).reset_index()
-    bad_days = activity.loc[
-        (activity["zero_rate"] >= blackout_threshold) & (activity["outlets"] >= 3),
-        [distributor_col, date_col],
-    ]
-    if bad_days.empty:
-        return df, _tag_reason(df.iloc[0:0], "blackout:none")
-
-    bad_keys = set(map(tuple, bad_days.itertuples(index=False, name=None)))
-    mask = df.apply(
-        lambda r: (r[distributor_col], r[date_col]) in bad_keys, axis=1
-    )
-    rejected = _tag_reason(
-        df[mask],
-        f"distributor_blackout(zero>={blackout_threshold:.0%})",
-    )
-    return df[~mask], rejected
+    if value_col not in df.columns or not all(c in df.columns for c in group_keys):
+        return df, _tag_reason(df.iloc[0:0], "low_vol:missing_cols")
+    out = df.copy()
+    out["_v"] = pd.to_numeric(out[value_col], errors="coerce")
+    thresh = out.groupby(group_keys)["_v"].transform(lambda s: s.quantile(quantile))
+    out["_low_volume_month_flag"] = (out["_v"] <= thresh).fillna(False) & out["_v"].notna()
+    out = out.drop(columns=["_v"])
+    return out, _tag_reason(df.iloc[0:0], "low_vol:tagged")
 
 
 @register("credit_cap_signature")

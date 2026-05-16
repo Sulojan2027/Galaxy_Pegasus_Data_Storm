@@ -1,11 +1,21 @@
-"""Silver Layer — Cleaning & Quarantine.
+"""Silver Layer — Cleaning, Quarantine, and Enrichment Joins.
 
 Applies the DQ pipeline (from `src.processing.data_quality`) to each Bronze
-dataset, then writes:
+dataset, then:
 
-- ``data/silver/<dataset>.parquet``     — clean rows
-- ``data/silver/_rejected/<dataset>__<run_id>.parquet`` — rejected rows w/ reasons
-- ``data/silver/_summary.json``         — per-dataset, per-check tallies
+1. Writes clean rows to ``data/silver/<dataset>.parquet``
+2. Writes rejected rows to ``data/silver/_rejected/<dataset>__<run_id>.parquet``
+   with a `failure_reason` column.
+3. Writes a per-dataset, per-check tally to ``data/silver/_summary.json``.
+
+Beyond pure cleaning we also perform Silver-stage enrichment that every
+downstream consumer needs:
+
+- Map categorical `seasonality_index` → numeric using `SEASONALITY_NUMERIC`.
+- Derive each outlet's primary `distributor_id` (from transactions) and
+  attach it to the outlet master.
+- Derive `province` from the distributor-ID prefix.
+- Join the coordinate file into the outlet master.
 
 Run as a script::
 
@@ -19,6 +29,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from src import config
@@ -36,7 +47,32 @@ def _outlets_pipeline() -> list[CheckSpec]:
     return [
         CheckSpec("null", {"mandatory_cols": s.mandatory_cols}),
         CheckSpec("duplicate", {"keys": s.primary_key}),
-        CheckSpec("format", {"col": "outlet_id", "dtype": "string"}),
+        # Normalize the dirty Outlet_Type / Outlet_Size string values.
+        CheckSpec("text_normalize", {
+            "col": "outlet_type",
+            "mapping": config.OUTLET_TYPE_CANONICAL,
+        }),
+        CheckSpec("text_normalize", {
+            "col": "outlet_size",
+            "mapping": config.OUTLET_SIZE_CANONICAL,
+        }),
+        CheckSpec("value_range", {"col": "cooler_count", "min_": 0, "max_": 100}),
+    ]
+
+
+def _coordinates_pipeline() -> list[CheckSpec]:
+    s = config.SCHEMAS["coordinates"]
+    return [
+        CheckSpec("null", {"mandatory_cols": s.mandatory_cols}),
+        CheckSpec("duplicate", {"keys": s.primary_key}),
+        # Attempt auto-fix for lat/lon swaps BEFORE bounding-box rejection.
+        CheckSpec("coord_swap_fix", {
+            "lat_col": "latitude",
+            "lon_col": "longitude",
+            "lat_bounds": s.numeric_ranges["latitude"],
+            "lon_bounds": s.numeric_ranges["longitude"],
+            "autofix": config.DQ_CONFIG["coord_swap_autofix"],
+        }),
         CheckSpec("value_range", {
             "col": "latitude",
             "min_": s.numeric_ranges["latitude"][0],
@@ -56,10 +92,11 @@ def _seasonality_pipeline() -> list[CheckSpec]:
         CheckSpec("null", {"mandatory_cols": s.mandatory_cols}),
         CheckSpec("duplicate", {"keys": s.primary_key}),
         CheckSpec("value_range", {"col": "month", "min_": 1, "max_": 12}),
-        CheckSpec("value_range", {
+        CheckSpec("value_range", {"col": "year", "min_": 2022, "max_": 2026}),
+        # `seasonality_index` is categorical — accept only the 3 known values.
+        CheckSpec("format", {
             "col": "seasonality_index",
-            "min_": s.numeric_ranges["seasonality_index"][0],
-            "max_": s.numeric_ranges["seasonality_index"][1],
+            "regex": "|".join(config.SEASONALITY_NUMERIC.keys()),
         }),
     ]
 
@@ -68,7 +105,7 @@ def _holidays_pipeline() -> list[CheckSpec]:
     s = config.SCHEMAS["holidays"]
     return [
         CheckSpec("null", {"mandatory_cols": s.mandatory_cols}),
-        CheckSpec("format", {"col": "date", "dtype": "date"}),
+        CheckSpec("format", {"col": "date", "dtype": "datetime"}),
         CheckSpec("duplicate", {"keys": s.primary_key}),
     ]
 
@@ -77,41 +114,24 @@ def _transactions_pipeline(outlets_df: pd.DataFrame) -> list[CheckSpec]:
     s = config.SCHEMAS["transactions"]
     return [
         CheckSpec("null", {"mandatory_cols": s.mandatory_cols}),
-        CheckSpec("format", {"col": "date", "dtype": "date"}),
-        CheckSpec("value_range", {
-            "col": "volume_liters",
-            "min_": s.numeric_ranges["volume_liters"][0],
-            "max_": s.numeric_ranges["volume_liters"][1],
-        }),
+        CheckSpec("format", {"col": "year", "dtype": "int"}),
+        CheckSpec("format", {"col": "month", "dtype": "int"}),
+        CheckSpec("value_range", {"col": "year", "min_": 2022, "max_": 2026}),
+        CheckSpec("value_range", {"col": "month", "min_": 1, "max_": 12}),
         CheckSpec("referential_integrity", {
             "fk_col": "outlet_id",
             "ref_df": outlets_df,
             "ref_col": "outlet_id",
         }),
-        # If transaction_id exists, use it; otherwise dedupe on a composite key.
-        CheckSpec("duplicate", {
-            "keys": ["transaction_id"] if "transaction_id" in outlets_df.columns
-                    else ["outlet_id", "date", "volume_liters"],
-        }),
-        CheckSpec("constant_run", {
-            "group_keys": ["outlet_id"],
-            "order_col": "date",
-            "value_col": "volume_liters",
-            "min_run": config.DQ_CONFIG["constant_run_min_days"],
-        }),
-        CheckSpec("distributor_blackout", {
-            "distributor_col": "distributor_id",
-            "date_col": "date",
-            "outlet_col": "outlet_id",
-            "value_col": "volume_liters",
-            "blackout_threshold": config.DQ_CONFIG["blackout_distributor_threshold"],
-        }),
-        # credit-cap is TAG-only (doesn't reject); kept last so it sees clean rows.
-        CheckSpec("credit_cap_signature", {
-            "group_keys": ["outlet_id"],
-            "value_col": "volume_liters",
-            "modulos": config.DQ_CONFIG["round_number_suspicion_modulos"],
-        }),
+        # Tag-only: don't reject returns/credits.
+        CheckSpec("negative_volume_tag", {"value_col": "volume_liters"}),
+        # Reject exact duplicates on the natural composite key.
+        CheckSpec("duplicate", {"keys": s.primary_key}),
+        # NOTE: low-volume-month and credit-cap fingerprints are applied at
+        # the MONTHLY-total grain inside `src/features/gold_enrichment.py`,
+        # not at the transaction-line grain. Applying them per-line produced
+        # huge false-positive rates (each line is a single SKU within a
+        # month, so per-line quantiles are uninformative).
     ]
 
 
@@ -123,8 +143,11 @@ def _adjust_pipeline_to_columns(
     for step in pipeline:
         params = step.params
         col = params.get("col")
-        cols = params.get("mandatory_cols") or params.get("keys")
-        # null/duplicate keep at least one valid col
+        cols = (
+            params.get("mandatory_cols")
+            or params.get("keys")
+            or params.get("group_keys")
+        )
         if col and col not in df.columns:
             logger.info("skipping %s on missing col %s", step.name, col)
             continue
@@ -133,6 +156,64 @@ def _adjust_pipeline_to_columns(
             continue
         keep.append(step)
     return keep
+
+
+# ---------------------------------------------------------------------------
+# Silver enrichment (after per-dataset cleaning)
+# ---------------------------------------------------------------------------
+def _enrich_seasonality(seasonality: pd.DataFrame) -> pd.DataFrame:
+    """Map categorical seasonality_index → numeric float index."""
+    if seasonality.empty or "seasonality_index" not in seasonality.columns:
+        return seasonality
+    out = seasonality.copy()
+    out["seasonality_label"] = out["seasonality_index"].astype("string").str.strip()
+    out["seasonality_index"] = out["seasonality_label"].map(config.SEASONALITY_NUMERIC).astype(float)
+    return out
+
+
+def _enrich_outlets(
+    outlets: pd.DataFrame,
+    coordinates: pd.DataFrame,
+    transactions: pd.DataFrame,
+) -> pd.DataFrame:
+    """Join coords + derive distributor_id and province per outlet."""
+    if outlets.empty:
+        return outlets
+
+    df = outlets.copy()
+
+    if not coordinates.empty:
+        df = df.merge(
+            coordinates[["outlet_id", "latitude", "longitude"]],
+            on="outlet_id",
+            how="left",
+        )
+
+    if not transactions.empty and "distributor_id" in transactions.columns:
+        # Each outlet's transactions are confined to one distributor (verified
+        # in EDA). Pick the most-frequent one defensively in case of stragglers.
+        per_outlet_dist = (
+            transactions.groupby("outlet_id")["distributor_id"]
+            .agg(lambda s: s.value_counts().index[0])
+            .rename("distributor_id")
+            .reset_index()
+        )
+        df = df.merge(per_outlet_dist, on="outlet_id", how="left")
+
+    if "distributor_id" in df.columns:
+        df["province"] = df["distributor_id"].apply(_distributor_to_province)
+    else:
+        df["province"] = np.nan
+    return df
+
+
+def _distributor_to_province(dist_id: str | float) -> str | float:
+    if not isinstance(dist_id, str):
+        return np.nan
+    for prefix, prov in config.DISTRIBUTOR_PREFIX_TO_PROVINCE.items():
+        if dist_id.startswith(prefix):
+            return prov
+    return np.nan
 
 
 # ---------------------------------------------------------------------------
@@ -182,25 +263,17 @@ def run_silver_cleaning(
 
     run_id = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
 
-    # We need outlets first so transactions can do RI against it.
-    outlets_bronze = bronze_dir / "outlets.parquet"
-    outlets_df = (
-        read_parquet(outlets_bronze)
-        if outlets_bronze.exists() else pd.DataFrame(columns=["outlet_id"])
-    )
-
+    # Step 1: clean each dataset independently.
     summaries: list[dict] = []
+
     summaries.append(_process_one(
         "outlets", _outlets_pipeline(),
         bronze_dir / "outlets.parquet", silver_dir, rejected_dir, run_id,
     ))
-    # reload the clean outlets for downstream RI
-    clean_outlets_path = silver_dir / "outlets.parquet"
-    clean_outlets = (
-        read_parquet(clean_outlets_path)
-        if clean_outlets_path.exists() else outlets_df
-    )
-
+    summaries.append(_process_one(
+        "coordinates", _coordinates_pipeline(),
+        bronze_dir / "coordinates.parquet", silver_dir, rejected_dir, run_id,
+    ))
     summaries.append(_process_one(
         "seasonality", _seasonality_pipeline(),
         bronze_dir / "seasonality.parquet", silver_dir, rejected_dir, run_id,
@@ -209,16 +282,52 @@ def run_silver_cleaning(
         "holidays", _holidays_pipeline(),
         bronze_dir / "holidays.parquet", silver_dir, rejected_dir, run_id,
     ))
+
+    # Reload clean outlets for the transactions RI check.
+    clean_outlets_path = silver_dir / "outlets.parquet"
+    clean_outlets = (
+        read_parquet(clean_outlets_path)
+        if clean_outlets_path.exists()
+        else pd.DataFrame(columns=["outlet_id"])
+    )
+
     summaries.append(_process_one(
         "transactions", _transactions_pipeline(clean_outlets),
         bronze_dir / "transactions.parquet", silver_dir, rejected_dir, run_id,
     ))
+
+    # Step 2: Silver-stage enrichment & re-write enriched outlets/seasonality.
+    transactions = (
+        read_parquet(silver_dir / "transactions.parquet")
+        if (silver_dir / "transactions.parquet").exists() else pd.DataFrame()
+    )
+    coordinates = (
+        read_parquet(silver_dir / "coordinates.parquet")
+        if (silver_dir / "coordinates.parquet").exists() else pd.DataFrame()
+    )
+    seasonality = (
+        read_parquet(silver_dir / "seasonality.parquet")
+        if (silver_dir / "seasonality.parquet").exists() else pd.DataFrame()
+    )
+
+    enriched_outlets = _enrich_outlets(clean_outlets, coordinates, transactions)
+    write_parquet(enriched_outlets, silver_dir / "outlets.parquet")
+
+    enriched_seasonality = _enrich_seasonality(seasonality)
+    write_parquet(enriched_seasonality, silver_dir / "seasonality.parquet")
 
     summary_path = silver_dir / "_summary.json"
     summary_path.write_text(json.dumps({
         "run_id": run_id,
         "generated_at": datetime.utcnow().isoformat() + "Z",
         "datasets": summaries,
+        "post_join": {
+            "outlets_with_coords": int(enriched_outlets["latitude"].notna().sum())
+                if "latitude" in enriched_outlets.columns else 0,
+            "outlets_with_distributor": int(enriched_outlets["distributor_id"].notna().sum())
+                if "distributor_id" in enriched_outlets.columns else 0,
+            "outlets_total": int(len(enriched_outlets)),
+        },
     }, indent=2, default=str))
     logger.info("Silver cleaning complete | summary -> %s", summary_path)
     return {"run_id": run_id, "datasets": summaries}

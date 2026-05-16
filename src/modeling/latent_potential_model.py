@@ -181,10 +181,15 @@ def estimate_unconstrained_extrapolation(
     features: pd.DataFrame,
     seasonality: pd.DataFrame,
     target_month: int = config.TARGET_MONTH_INT,
+    target_year: int = config.TARGET_MONTH_YEAR,
+    fallback_year: int = config.SEASONALITY_FALLBACK_YEAR,
 ) -> pd.Series:
     """For outlets with ≥ min_unconstrained_months unconstrained months, use the
     deflated max of those months as the latent ceiling, then re-apply the
     target-month distributor seasonality index.
+
+    Seasonality data only covers 2023–2025, so for January 2026 we use the
+    January `fallback_year` (default 2025) index as a proxy.
     """
     df = features.copy()
     min_months = config.MODEL_CONFIG["min_unconstrained_months"]
@@ -192,11 +197,16 @@ def estimate_unconstrained_extrapolation(
     season_idx = pd.Series(1.0, index=df.index)
     if not seasonality.empty and "distributor_id" in df.columns:
         s = seasonality.copy()
-        for c in ("seasonality_index", "month"):
+        for c in ("seasonality_index", "month", "year"):
             if c in s.columns:
                 s[c] = pd.to_numeric(s[c], errors="coerce")
-        target_season = s[s["month"] == target_month][["distributor_id", "seasonality_index"]]
-        target_season = target_season.drop_duplicates("distributor_id")
+        if "year" in s.columns:
+            target_season = s[(s["month"] == target_month) & (s["year"] == target_year)]
+            if target_season.empty:
+                target_season = s[(s["month"] == target_month) & (s["year"] == fallback_year)]
+        else:
+            target_season = s[s["month"] == target_month]
+        target_season = target_season[["distributor_id", "seasonality_index"]].drop_duplicates("distributor_id")
         mapping = dict(zip(target_season["distributor_id"], target_season["seasonality_index"]))
         season_idx = df["distributor_id"].map(mapping).fillna(1.0)
     df["_target_season"] = season_idx.replace(0, 1.0).fillna(1.0)

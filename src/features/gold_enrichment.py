@@ -1,20 +1,14 @@
 """Gold Layer — Feature Engineering / Enrichment.
 
-Builds the model-ready table at the **outlet level**, combining:
+Builds the model-ready tables. Transactions are already at outlet × year ×
+month × distributor × SKU grain, so monthly aggregation here is over SKUs.
 
-- Cleaned transactions (Silver)         — observed volume signals
-- Outlet master (Silver)                — geo + channel attributes
-- Distributor seasonality (Silver)      — month indices
-- Holidays (Silver)                     — activity context
-- POI features (external/poi)           — catchment / footfall proxies
+Outputs:
 
-Key outputs:
-
-- ``data/gold/outlet_monthly.parquet`` — long-format outlet × month
-  observations with `is_constrained` flag (for the modeling layer).
-- ``data/gold/outlet_features.parquet`` — wide outlet-level feature table
-  used by the peer-ceiling, quantile-regression, and unconstrained-
-  extrapolation estimators.
+- ``data/gold/outlet_monthly.parquet`` — outlet × year × month rows with
+  `is_constrained` flag and seasonality-deflated volume.
+- ``data/gold/outlet_features.parquet`` — wide outlet-level table consumed
+  by the modeling layer.
 """
 
 from __future__ import annotations
@@ -57,82 +51,90 @@ def build_outlet_monthly(
     transactions: pd.DataFrame,
     seasonality: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Aggregate transactions to outlet × month + flag constrained months.
+    """Aggregate transactions to outlet × year × month.
 
-    A month is flagged `is_constrained` if ANY of the following hold:
-      - the outlet's credit-cap signature triggered for that month
-      - the month had a stockout/blackout proxy (>=25% of days had zero volume
-        despite the outlet being otherwise active)
-      - the outlet hit its observed monthly max within ±2% multiple times
-        (a soft ceiling fingerprint)
+    The raw rows are at outlet × y × m × distributor × SKU. We collapse
+    over SKU so each row in the output is one observed outlet-month with:
 
-    Constrained months are NOT used as ground-truth ceilings downstream.
+    - `volume_total`           — net volume (purchases minus returns)
+    - `volume_gross`           — sum of |volume| ignoring sign
+    - `volume_returns`         — sum of negative volume magnitudes
+    - `bill_total`             — net revenue (LKR)
+    - `sku_diversity`          — number of distinct SKUs purchased
+    - `n_lines`                — number of transaction rows
+    - `any_credit_cap`         — credit-cap-signature fingerprint
+    - `low_volume_month_flag`  — outlet's-own-low-quantile flag from DQ
+    - `is_constrained`         — union of constraint signals (see below)
+    - `seasonality_index`      — numeric, mapped at Silver
+    - `volume_total_deflated`  — volume_total / seasonality_index
     """
     if transactions.empty:
         return pd.DataFrame()
 
     df = transactions.copy()
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date", "outlet_id"])
-    df["volume_liters"] = pd.to_numeric(df["volume_liters"], errors="coerce").fillna(0.0)
-    df["year_month"] = df["date"].dt.to_period("M").dt.to_timestamp()
-    df["month"] = df["date"].dt.month
+    for c in ("year", "month", "volume_liters", "total_bill_value"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    if "_is_return" not in df.columns:
+        df["_is_return"] = df["volume_liters"].lt(0).fillna(False)
 
-    credit_cap_flag = (
-        df["_credit_cap_flag"]
-        if "_credit_cap_flag" in df.columns
-        else pd.Series(False, index=df.index)
-    )
-    df["_credit_cap_flag"] = credit_cap_flag.fillna(False)
+    df["_returns_vol"] = np.where(df["_is_return"], -df["volume_liters"], 0.0)
+    df["_purchase_vol"] = np.where(~df["_is_return"], df["volume_liters"], 0.0)
+    df["_abs_vol"] = df["volume_liters"].abs()
 
-    grouped = df.groupby(["outlet_id", "year_month"], dropna=False)
+    grouped = df.groupby(["outlet_id", "year", "month"], dropna=False)
     monthly = grouped.agg(
         volume_total=("volume_liters", "sum"),
-        volume_max_day=("volume_liters", "max"),
-        volume_mean_day=("volume_liters", "mean"),
-        volume_p90_day=("volume_liters", lambda s: float(np.nanpercentile(s, 90))),
-        active_days=("volume_liters", lambda s: int((s > 0).sum())),
-        total_days=("volume_liters", "size"),
-        any_credit_cap=("_credit_cap_flag", "any"),
-        distributor_id=("distributor_id", "first") if "distributor_id" in df.columns else ("outlet_id", "first"),
-        month=("month", "first"),
+        volume_gross=("_abs_vol", "sum"),
+        volume_returns=("_returns_vol", "sum"),
+        volume_purchases=("_purchase_vol", "sum"),
+        bill_total=("total_bill_value", "sum"),
+        sku_diversity=("sku_id", "nunique"),
+        n_lines=("volume_liters", "size"),
+        distributor_id=("distributor_id", "first"),
     ).reset_index()
 
-    monthly["zero_day_share"] = 1.0 - (monthly["active_days"] / monthly["total_days"].clip(lower=1))
-    monthly["stockout_flag"] = monthly["zero_day_share"] >= 0.25
+    monthly["return_share"] = (monthly["volume_returns"] / monthly["volume_gross"].replace(0, np.nan)).fillna(0.0)
 
-    # Soft ceiling fingerprint: many days at near-max volume within the month
-    def near_max_share(s: pd.Series) -> float:
-        if s.empty or s.max() <= 0:
-            return 0.0
-        m = s.max()
-        return float(((s >= 0.98 * m) & (s > 0)).mean())
-
-    near_max = grouped["volume_liters"].apply(near_max_share).rename("near_max_share").reset_index()
-    monthly = monthly.merge(near_max, on=["outlet_id", "year_month"], how="left")
-    monthly["soft_ceiling_flag"] = monthly["near_max_share"] >= 0.40
-
-    monthly["is_constrained"] = (
-        monthly["any_credit_cap"].fillna(False)
-        | monthly["stockout_flag"]
-        | monthly["soft_ceiling_flag"]
+    # ---- Constraint flagging at the outlet-MONTH level ----
+    # 1. Stockout proxy: monthly volume far below the outlet's own median.
+    outlet_median = monthly.groupby("outlet_id")["volume_total"].transform("median")
+    monthly["low_volume_flag"] = (
+        (monthly["volume_total"] > 0)
+        & (monthly["volume_total"] < 0.5 * outlet_median)
     )
 
-    # Seasonality-deflate the monthly totals so they're comparable across months.
+    # 2. Single-SKU month — distributor or route restriction.
+    monthly["low_sku_diversity_flag"] = (
+        monthly["sku_diversity"] < config.DQ_CONFIG["min_sku_diversity"]
+    )
+
+    # 3. Credit-cap fingerprint on the monthly total (not per-line).
+    modulos = config.DQ_CONFIG["round_number_suspicion_modulos"]
+    monthly["credit_cap_flag"] = False
+    for m in modulos:
+        is_round = (monthly["volume_total"].abs() > 0) & (monthly["volume_total"].abs() % m == 0)
+        monthly["credit_cap_flag"] |= is_round
+
+    # NOTE: we DO NOT flag near-max months as constrained at monthly grain.
+    # Those are the months that most likely reveal true demand and feed the
+    # unconstrained-extrapolation estimator downstream.
+    monthly["is_constrained"] = (
+        monthly["low_volume_flag"]
+        | monthly["low_sku_diversity_flag"]
+        | monthly["credit_cap_flag"]
+    )
+
+    # Join numeric seasonality (already converted at Silver stage).
     if not seasonality.empty:
-        s = seasonality.copy()
-        for c in ("seasonality_index", "month"):
-            if c in s.columns:
-                s[c] = pd.to_numeric(s[c], errors="coerce")
-        join_keys = [c for c in ("distributor_id", "month") if c in s.columns and c in monthly.columns]
-        if join_keys:
+        join_cols = [c for c in ("distributor_id", "year", "month")
+                     if c in seasonality.columns and c in monthly.columns]
+        if join_cols and "seasonality_index" in seasonality.columns:
             monthly = monthly.merge(
-                s[join_keys + ["seasonality_index"]].drop_duplicates(join_keys),
-                on=join_keys, how="left",
+                seasonality[join_cols + ["seasonality_index"]].drop_duplicates(join_cols),
+                on=join_cols, how="left",
             )
-        else:
-            monthly["seasonality_index"] = np.nan
-    else:
+    if "seasonality_index" not in monthly.columns:
         monthly["seasonality_index"] = np.nan
     monthly["seasonality_index"] = monthly["seasonality_index"].fillna(1.0).replace(0, 1.0)
     monthly["volume_total_deflated"] = monthly["volume_total"] / monthly["seasonality_index"]
@@ -148,7 +150,7 @@ def build_outlet_features(
     monthly: pd.DataFrame,
     poi: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Outlet-level wide feature table for the modeling layer."""
+    """Outlet-level wide feature table consumed by the modeling layer."""
 
     if monthly.empty:
         logger.warning("monthly table empty — outlet features will be sparse")
@@ -156,7 +158,7 @@ def build_outlet_features(
     if not monthly.empty:
         unc = monthly[~monthly["is_constrained"]]
         agg = monthly.groupby("outlet_id").agg(
-            months_observed=("year_month", "nunique"),
+            months_observed=("month", "size"),
             months_constrained=("is_constrained", "sum"),
             months_unconstrained=("is_constrained", lambda s: int((~s).sum())),
             hist_total_mean=("volume_total", "mean"),
@@ -168,15 +170,20 @@ def build_outlet_features(
             hist_total_std=("volume_total", "std"),
             hist_deflated_max=("volume_total_deflated", "max"),
             hist_deflated_p90=("volume_total_deflated", lambda s: float(np.nanpercentile(s, 90))),
+            hist_sku_diversity_mean=("sku_diversity", "mean"),
+            hist_sku_diversity_max=("sku_diversity", "max"),
+            hist_return_share_mean=("return_share", "mean"),
+            hist_bill_total_mean=("bill_total", "mean"),
         ).reset_index()
 
-        unc_agg = unc.groupby("outlet_id").agg(
-            unc_deflated_max=("volume_total_deflated", "max"),
-            unc_deflated_p90=("volume_total_deflated", lambda s: float(np.nanpercentile(s, 90))),
-            unc_deflated_mean=("volume_total_deflated", "mean"),
-            unc_months=("year_month", "nunique"),
-        ).reset_index()
-        agg = agg.merge(unc_agg, on="outlet_id", how="left")
+        if not unc.empty:
+            unc_agg = unc.groupby("outlet_id").agg(
+                unc_deflated_max=("volume_total_deflated", "max"),
+                unc_deflated_p90=("volume_total_deflated", lambda s: float(np.nanpercentile(s, 90))),
+                unc_deflated_mean=("volume_total_deflated", "mean"),
+                unc_months=("month", "size"),
+            ).reset_index()
+            agg = agg.merge(unc_agg, on="outlet_id", how="left")
     else:
         agg = pd.DataFrame(columns=["outlet_id"])
 
@@ -185,10 +192,24 @@ def build_outlet_features(
     if not poi.empty and "outlet_id" in poi.columns:
         df = df.merge(poi, on="outlet_id", how="left")
 
-    # Lightweight derived features
+    # One-hot the small categorical attributes — useful for the QR/peer cluster.
+    if "outlet_size" in df.columns:
+        df = df.join(pd.get_dummies(df["outlet_size"].astype("string"),
+                                    prefix="size", dummy_na=False).astype(int))
+    if "outlet_type" in df.columns:
+        df = df.join(pd.get_dummies(df["outlet_type"].astype("string"),
+                                    prefix="type", dummy_na=False).astype(int))
+    if "province" in df.columns:
+        df = df.join(pd.get_dummies(df["province"].astype("string"),
+                                    prefix="prov", dummy_na=False).astype(int))
+
     if "hist_total_max" in df.columns and "hist_total_mean" in df.columns:
-        df["volume_cv"] = (df["hist_total_std"] / df["hist_total_mean"]).replace([np.inf, -np.inf], np.nan)
-        df["max_to_mean_ratio"] = (df["hist_total_max"] / df["hist_total_mean"]).replace([np.inf, -np.inf], np.nan)
+        df["volume_cv"] = (df["hist_total_std"] / df["hist_total_mean"]).replace(
+            [np.inf, -np.inf], np.nan
+        )
+        df["max_to_mean_ratio"] = (df["hist_total_max"] / df["hist_total_mean"]).replace(
+            [np.inf, -np.inf], np.nan
+        )
 
     return df
 

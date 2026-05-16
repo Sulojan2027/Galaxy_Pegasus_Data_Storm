@@ -25,24 +25,28 @@ logger = logging.getLogger(__name__)
 # Maps a wide range of plausible raw column names to the canonical names used
 # by SCHEMAS in src/config.py. Extend freely as you encounter new aliases.
 CANONICAL_ALIASES: dict[str, list[str]] = {
-    "transaction_id": ["transaction_id", "txn_id", "txnid", "trans_id", "id"],
     "outlet_id":     ["outlet_id", "outletid", "store_id", "shop_id", "retailer_id"],
     "distributor_id": ["distributor_id", "distributorid", "dist_id", "distributor"],
     "date":          ["date", "txn_date", "transaction_date", "invoice_date", "order_date"],
+    "year":          ["year", "yr", "transaction_year"],
+    "month":         ["month", "mon", "month_num", "transaction_month"],
     "volume_liters": ["volume_liters", "volume", "qty_liters", "quantity_liters",
                       "litres", "liters", "qty", "volume_ltr"],
+    "total_bill_value": ["total_bill_value", "bill_value", "total_value", "value",
+                         "revenue", "total_revenue", "amount"],
     "sku_id":        ["sku_id", "sku", "product_id", "item_id"],
-    "outlet_name":   ["outlet_name", "name", "shop_name", "store_name"],
-    "outlet_type":   ["outlet_type", "type", "channel", "category"],
+    "product_name":  ["product_name", "product", "item_name", "sku_name"],
+    "outlet_size":   ["outlet_size", "outlet_class"],
+    "cooler_count":  ["cooler_count", "coolers", "fridge_count", "num_coolers"],
+    "outlet_type":   ["outlet_type", "channel"],
     "province":      ["province", "state", "region"],
     "district":      ["district", "area"],
-    "latitude":      ["latitude", "lat", "y"],
-    "longitude":     ["longitude", "lon", "lng", "long", "x"],
-    "month":         ["month", "mon", "month_num"],
-    "seasonality_index": ["seasonality_index", "season_index", "index",
-                          "seasonality_factor", "factor"],
-    "holiday_name":  ["holiday_name", "holiday", "name", "description"],
-    "holiday_type":  ["holiday_type", "type", "category"],
+    "latitude":      ["latitude", "lat", "gps_lat"],
+    "longitude":     ["longitude", "lon", "lng", "gps_lon"],
+    "seasonality_index": ["seasonality_index", "season_index",
+                          "seasonality_factor", "seasonality_tag"],
+    "holiday_name":  ["holiday_name", "holiday_description"],
+    "holiday_type":  ["holiday_type"],
 }
 
 
