@@ -1,29 +1,4 @@
-"""Latent Potential Estimation — three independent estimators + ensemble.
-
-The observed volume `y_obs` is left-censored:
-
-    y_obs = min(y_true_demand, capacity_constraint)
-
-Hence the classic regression target is biased downward whenever the outlet
-is constrained.  We triangulate the latent ceiling using three approaches
-that fail in *different ways*, then ensemble them:
-
-1. **Peer ceiling** (non-parametric).  Find each outlet's peer cluster on
-   (POI density, geo, channel, historical scale).  The outlet's potential
-   is the seasonality-adjusted high-quantile of its peers' best
-   *unconstrained* months, rescaled to the outlet's own demonstrated
-   relative size within the cluster.
-
-2. **Quantile regression** (parametric, robust).  Fit τ=0.90 quantile
-   regression on outlet-level features → predicts the upper envelope of
-   the conditional volume distribution rather than its mean.
-
-3. **Unconstrained extrapolation** (empirical).  For each outlet with
-   enough unconstrained months, take the deflated max of those months and
-   project it onto January 2026 via the distributor's seasonality index.
-
-Final potential = weighted blend (configurable in MODEL_CONFIG).
-"""
+"""Latent Potential Estimation — three independent estimators + ensemble."""
 
 from __future__ import annotations
 
@@ -43,9 +18,7 @@ from src.utils.io import read_parquet, setup_logging, write_csv, write_parquet
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
 # Feature selection helpers
-# ---------------------------------------------------------------------------
 def _select_numeric_features(df: pd.DataFrame, exclude: set[str]) -> list[str]:
     return [
         c for c in df.columns
@@ -62,19 +35,13 @@ def _prep_matrix(df: pd.DataFrame, cols: list[str]) -> np.ndarray:
     return sc.fit_transform(imp.fit_transform(df[cols]))
 
 
-# ---------------------------------------------------------------------------
 # 1. Peer ceiling
-# ---------------------------------------------------------------------------
 def estimate_peer_ceiling(
     features: pd.DataFrame,
     k: int | None = None,
     quantile: float | None = None,
 ) -> pd.Series:
-    """Cluster outlets by POI/geo/channel/scale; potential = peer high-quantile.
-
-    The peer's "best" is taken from the unconstrained-deflated p90 column when
-    available; falls back to deflated p90 of all months otherwise.
-    """
+    """Cluster outlets to find peer ceiling."""
     k = k or config.MODEL_CONFIG["peer_cluster_count"]
     quantile = quantile or config.MODEL_CONFIG["peer_ceiling_quantile"]
     df = features.copy()
@@ -113,18 +80,13 @@ def estimate_peer_ceiling(
     return df["peer_ceiling"]
 
 
-# ---------------------------------------------------------------------------
 # 2. Quantile regression
-# ---------------------------------------------------------------------------
 def estimate_quantile_regression(
     features: pd.DataFrame,
     target_col: str | None = None,
     tau: float | None = None,
 ) -> pd.Series:
-    """Fit a high-quantile regression on outlet-level features.
-
-    Falls back gracefully when statsmodels/sklearn isn't happy with the data.
-    """
+    """Fit a high-quantile regression on outlet-level features."""
     tau = tau or config.MODEL_CONFIG["quantile_regression_tau"]
 
     target_col = target_col or (
@@ -174,9 +136,7 @@ def estimate_quantile_regression(
     return pd.Series(preds, index=features.index, name="quantile_regression")
 
 
-# ---------------------------------------------------------------------------
 # 3. Unconstrained extrapolation
-# ---------------------------------------------------------------------------
 def estimate_unconstrained_extrapolation(
     features: pd.DataFrame,
     seasonality: pd.DataFrame,
@@ -184,13 +144,7 @@ def estimate_unconstrained_extrapolation(
     target_year: int = config.TARGET_MONTH_YEAR,
     fallback_year: int = config.SEASONALITY_FALLBACK_YEAR,
 ) -> pd.Series:
-    """For outlets with ≥ min_unconstrained_months unconstrained months, use the
-    deflated max of those months as the latent ceiling, then re-apply the
-    target-month distributor seasonality index.
-
-    Seasonality data only covers 2023–2025, so for January 2026 we use the
-    January `fallback_year` (default 2025) index as a proxy.
-    """
+    """Extrapolate target month potential using unconstrained max."""
     df = features.copy()
     min_months = config.MODEL_CONFIG["min_unconstrained_months"]
 
@@ -224,20 +178,14 @@ def estimate_unconstrained_extrapolation(
     return out
 
 
-# ---------------------------------------------------------------------------
 # Ensemble
-# ---------------------------------------------------------------------------
 def ensemble_predictions(
     peer: pd.Series,
     qreg: pd.Series,
     unc: pd.Series,
     weights: dict[str, float] | None = None,
 ) -> pd.Series:
-    """Weighted blend with graceful NaN handling.
-
-    For each row, weights are renormalized over the methods that returned a
-    valid (non-NaN, non-negative) estimate.
-    """
+    """Weighted blend with graceful NaN handling."""
     weights = weights or config.MODEL_CONFIG["ensemble_weights"]
     methods = {
         "peer_ceiling": peer.reindex(peer.index),
@@ -255,9 +203,7 @@ def ensemble_predictions(
     return blended.rename("ensemble_potential")
 
 
-# ---------------------------------------------------------------------------
 # Top-level runner
-# ---------------------------------------------------------------------------
 def run_modeling(
     gold_dir: Path | None = None,
     silver_dir: Path | None = None,
@@ -296,11 +242,11 @@ def run_modeling(
     out["unconstrained_extrapolation"] = unc.values
     out["Maximum_Monthly_Liters"] = blended.values
 
-    # ---- Audit / diagnostics ----
+    # Audit / diagnostics
     diag_path = predictions_dir / "modeling_diagnostics.parquet"
     write_parquet(out, diag_path)
 
-    # ---- Final deliverable CSV ----
+    # Final deliverable CSV
     final = out[["outlet_id", "Maximum_Monthly_Liters"]].rename(
         columns={"outlet_id": "Outlet_ID"}
     )

@@ -1,9 +1,4 @@
-"""Project-wide configuration.
-
-Single source of truth for paths, schema contracts, primary keys, DQ
-thresholds, and business constants. Updated to match the actual
-Data Storm v7.0 file schemas after inspection.
-"""
+"""Project-wide configuration."""
 
 from __future__ import annotations
 
@@ -11,9 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-# ---------------------------------------------------------------------------
 # Paths
-# ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 DATA_DIR = PROJECT_ROOT / "data"
@@ -32,9 +25,7 @@ for _p in (
 ):
     _p.mkdir(parents=True, exist_ok=True)
 
-# ---------------------------------------------------------------------------
 # Source file mapping
-# ---------------------------------------------------------------------------
 SOURCE_FILES: dict[str, str] = {
     "transactions": "transactions_history_final.csv",
     "outlets":      "outlet_master.csv",
@@ -43,9 +34,7 @@ SOURCE_FILES: dict[str, str] = {
     "holidays":     "holiday_list.csv",
 }
 
-# ---------------------------------------------------------------------------
 # Schema contracts
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -66,8 +55,7 @@ SCHEMAS: dict[str, DatasetSchema] = {
             "outlet_id", "year", "month", "distributor_id", "sku_id",
             "volume_liters", "total_bill_value",
         ],
-        # Note: Volume_Liters can be negative (returns/credits). We TAG these
-        # via a custom check rather than rejecting via value_range.
+        # Note: Volume_Liters can be negative (returns/credits).
         numeric_ranges={
             "year": (2022, 2026),
             "month": (1, 12),
@@ -96,18 +84,14 @@ SCHEMAS: dict[str, DatasetSchema] = {
     ),
     "holidays": DatasetSchema(
         name="holidays",
-        # A single holiday legitimately gets multiple Holiday_Type rows
-        # (e.g. Vesak Poya Day is both Public AND Poya Day). The natural PK
-        # is the full triple.
+        # Holiday can have multiple types; PK is the full triple.
         primary_key=["date", "holiday_name", "holiday_type"],
         mandatory_cols=["date", "holiday_name", "holiday_type"],
         date_cols=["date"],
     ),
 }
 
-# ---------------------------------------------------------------------------
 # Business / domain constants
-# ---------------------------------------------------------------------------
 TARGET_MONTH_INT = 1            # January 2026
 TARGET_MONTH_YEAR = 2026
 TARGET_MONTH_LABEL = "2026-01"
@@ -123,7 +107,7 @@ EXPECTED_DISTRIBUTORS = [
 EXPECTED_PROVINCES = ["Western", "Central", "North-Western", "Southern"]
 EXPECTED_SKUS = [f"SKU_{i:02d}" for i in range(1, 11)]
 
-# Map distributor-ID prefix → province (the master file lacks province).
+# Map distributor-ID prefix to province.
 DISTRIBUTOR_PREFIX_TO_PROVINCE = {
     "DIST_W_": "Western",
     "DIST_C_": "Central",
@@ -131,10 +115,7 @@ DISTRIBUTOR_PREFIX_TO_PROVINCE = {
     "DIST_S_": "Southern",
 }
 
-# Categorical seasonality → multiplicative numeric index.
-# These three categories are the only values that appear in the data.
-# Values chosen to be (a) symmetric around 1.0 and (b) of plausible FMCG
-# magnitude (~±15% swing between favorable and un-favorable months).
+# Categorical seasonality to multiplicative numeric index.
 SEASONALITY_NUMERIC: dict[str, float] = {
     "Favorable":    1.15,
     "Moderate":     1.00,
@@ -160,9 +141,7 @@ OUTLET_SIZE_CANONICAL: dict[str, str] = {
     "extra large": "Extra Large",
 }
 
-# ---------------------------------------------------------------------------
 # Data quality thresholds
-# ---------------------------------------------------------------------------
 DQ_CONFIG: dict[str, Any] = {
     "round_number_suspicion_modulos": [50, 100, 500, 1000],
     "duplicate_strict": True,
@@ -174,9 +153,7 @@ DQ_CONFIG: dict[str, Any] = {
     "near_max_share_threshold": 0.20,  # tightness near outlet's own max
 }
 
-# ---------------------------------------------------------------------------
 # POI scraping
-# ---------------------------------------------------------------------------
 POI_CONFIG: dict[str, Any] = {
     "overpass_endpoint": "https://overpass-api.de/api/interpreter",
     "radii_meters": [500, 1000],
@@ -201,9 +178,7 @@ POI_CONFIG: dict[str, Any] = {
     },
 }
 
-# ---------------------------------------------------------------------------
 # Modeling
-# ---------------------------------------------------------------------------
 MODEL_CONFIG: dict[str, Any] = {
     "peer_cluster_count": 25,
     "peer_ceiling_quantile": 0.90,

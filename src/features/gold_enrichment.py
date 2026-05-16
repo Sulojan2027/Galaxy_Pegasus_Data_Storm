@@ -1,15 +1,4 @@
-"""Gold Layer — Feature Engineering / Enrichment.
-
-Builds the model-ready tables. Transactions are already at outlet × year ×
-month × distributor × SKU grain, so monthly aggregation here is over SKUs.
-
-Outputs:
-
-- ``data/gold/outlet_monthly.parquet`` — outlet × year × month rows with
-  `is_constrained` flag and seasonality-deflated volume.
-- ``data/gold/outlet_features.parquet`` — wide outlet-level table consumed
-  by the modeling layer.
-"""
+"""Gold Layer — Feature Engineering / Enrichment."""
 
 from __future__ import annotations
 
@@ -25,9 +14,7 @@ from src.utils.io import read_parquet, setup_logging, write_parquet
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
 # Loaders
-# ---------------------------------------------------------------------------
 def _safe_read(name: str) -> pd.DataFrame:
     p = config.SILVER_DIR / f"{name}.parquet"
     if not p.exists():
@@ -44,30 +31,12 @@ def _load_poi() -> pd.DataFrame:
     return read_parquet(p)
 
 
-# ---------------------------------------------------------------------------
-# Monthly aggregation + constraint flagging
-# ---------------------------------------------------------------------------
+# Monthly aggregation
 def build_outlet_monthly(
     transactions: pd.DataFrame,
     seasonality: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Aggregate transactions to outlet × year × month.
-
-    The raw rows are at outlet × y × m × distributor × SKU. We collapse
-    over SKU so each row in the output is one observed outlet-month with:
-
-    - `volume_total`           — net volume (purchases minus returns)
-    - `volume_gross`           — sum of |volume| ignoring sign
-    - `volume_returns`         — sum of negative volume magnitudes
-    - `bill_total`             — net revenue (LKR)
-    - `sku_diversity`          — number of distinct SKUs purchased
-    - `n_lines`                — number of transaction rows
-    - `any_credit_cap`         — credit-cap-signature fingerprint
-    - `low_volume_month_flag`  — outlet's-own-low-quantile flag from DQ
-    - `is_constrained`         — union of constraint signals (see below)
-    - `seasonality_index`      — numeric, mapped at Silver
-    - `volume_total_deflated`  — volume_total / seasonality_index
-    """
+    """Aggregate transactions to outlet × year × month."""
     if transactions.empty:
         return pd.DataFrame()
 
@@ -96,36 +65,34 @@ def build_outlet_monthly(
 
     monthly["return_share"] = (monthly["volume_returns"] / monthly["volume_gross"].replace(0, np.nan)).fillna(0.0)
 
-    # ---- Constraint flagging at the outlet-MONTH level ----
-    # 1. Stockout proxy: monthly volume far below the outlet's own median.
+    # Constraint flagging at the outlet-MONTH level
+    # 1. Stockout proxy
     outlet_median = monthly.groupby("outlet_id")["volume_total"].transform("median")
     monthly["low_volume_flag"] = (
         (monthly["volume_total"] > 0)
         & (monthly["volume_total"] < 0.5 * outlet_median)
     )
 
-    # 2. Single-SKU month — distributor or route restriction.
+    # 2. Single-SKU month
     monthly["low_sku_diversity_flag"] = (
         monthly["sku_diversity"] < config.DQ_CONFIG["min_sku_diversity"]
     )
 
-    # 3. Credit-cap fingerprint on the monthly total (not per-line).
+    # 3. Credit-cap fingerprint
     modulos = config.DQ_CONFIG["round_number_suspicion_modulos"]
     monthly["credit_cap_flag"] = False
     for m in modulos:
         is_round = (monthly["volume_total"].abs() > 0) & (monthly["volume_total"].abs() % m == 0)
         monthly["credit_cap_flag"] |= is_round
 
-    # NOTE: we DO NOT flag near-max months as constrained at monthly grain.
-    # Those are the months that most likely reveal true demand and feed the
-    # unconstrained-extrapolation estimator downstream.
+    # Unconstrained months reveal true demand.
     monthly["is_constrained"] = (
         monthly["low_volume_flag"]
         | monthly["low_sku_diversity_flag"]
         | monthly["credit_cap_flag"]
     )
 
-    # Join numeric seasonality (already converted at Silver stage).
+    # Join numeric seasonality
     if not seasonality.empty:
         join_cols = [c for c in ("distributor_id", "year", "month")
                      if c in seasonality.columns and c in monthly.columns]
@@ -142,9 +109,7 @@ def build_outlet_monthly(
     return monthly
 
 
-# ---------------------------------------------------------------------------
 # Outlet-level rollup
-# ---------------------------------------------------------------------------
 def build_outlet_features(
     outlets: pd.DataFrame,
     monthly: pd.DataFrame,
@@ -192,7 +157,7 @@ def build_outlet_features(
     if not poi.empty and "outlet_id" in poi.columns:
         df = df.merge(poi, on="outlet_id", how="left")
 
-    # One-hot the small categorical attributes — useful for the QR/peer cluster.
+    # One-hot small categorical attributes.
     if "outlet_size" in df.columns:
         df = df.join(pd.get_dummies(df["outlet_size"].astype("string"),
                                     prefix="size", dummy_na=False).astype(int))
@@ -214,9 +179,7 @@ def build_outlet_features(
     return df
 
 
-# ---------------------------------------------------------------------------
 # Runner
-# ---------------------------------------------------------------------------
 def run_gold_enrichment(
     silver_dir: Path | None = None,
     gold_dir: Path | None = None,
