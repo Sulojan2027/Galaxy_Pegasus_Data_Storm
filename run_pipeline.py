@@ -1,14 +1,4 @@
-"""End-to-end pipeline orchestrator.
-
-Usage:
-    python run_pipeline.py [--skip-poi] [--poi-limit N] [--team galaxy_pegasus]
-
-Runs:
-    Bronze ingestion → Silver cleaning → POI scraping → Gold enrichment → Modeling
-
-POI scraping is the only slow / network-dependent stage; everything is cached
-so you can run it once and skip thereafter with `--skip-poi`.
-"""
+"""End-to-end pipeline orchestrator."""
 
 from __future__ import annotations
 

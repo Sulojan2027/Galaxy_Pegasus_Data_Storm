@@ -1,22 +1,4 @@
-"""POI scraping via the OpenStreetMap Overpass API.
-
-Design goals
-------------
-1. **Cache everything.** Each outlet × radius response is cached as parquet on
-   disk so the pipeline can resume after Overpass outages or rate limits.
-2. **Be polite.** Exponential backoff on 429/504; small batch sizes; honor
-   the Overpass `[timeout:]` directive.
-3. **Be deterministic.** Same outlet + same radius + same taxonomy version
-   ⇒ same cache key.
-4. **Be testable.** All HTTP calls go through a single function that can be
-   monkey-patched in tests.
-
-Outputs
--------
-- ``data/external/poi/raw/<outlet_id>__<radius>.json`` — raw Overpass JSON
-- ``data/external/poi/poi_features.parquet``           — one row per outlet,
-  with counts and nearest-distance features per category × radius.
-"""
+"""POI scraping via the OpenStreetMap Overpass API."""
 
 from __future__ import annotations
 
@@ -43,9 +25,7 @@ POI_RAW_DIR = config.POI_CACHE_DIR / "raw"
 POI_RAW_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ---------------------------------------------------------------------------
 # Overpass query builder
-# ---------------------------------------------------------------------------
 def build_overpass_query(
     lat: float,
     lon: float,
@@ -53,12 +33,7 @@ def build_overpass_query(
     taxonomy: dict[str, str],
     timeout_s: int = 60,
 ) -> str:
-    """Build a single Overpass QL query that returns all configured POIs
-    around (lat, lon) within `radius_m` meters.
-
-    Each tag filter produces both nwr (node/way/relation) — counts and
-    distances handle all geometry types.
-    """
+    """Build an Overpass QL query returning POIs within radius."""
     filters = []
     for cat, tag_filter in taxonomy.items():
         # `out center` returns a representative point for ways/relations.
@@ -72,9 +47,7 @@ out center tags;
 """
 
 
-# ---------------------------------------------------------------------------
-# HTTP layer (rate-limited, retried)
-# ---------------------------------------------------------------------------
+# HTTP layer
 def _overpass_post(
     query: str,
     endpoint: str = config.POI_CONFIG["overpass_endpoint"],
@@ -116,9 +89,7 @@ def _overpass_post(
     return None
 
 
-# ---------------------------------------------------------------------------
 # Per-outlet scrape
-# ---------------------------------------------------------------------------
 def _cache_path(outlet_id: str, radius_m: int) -> Path:
     safe = "".join(c if c.isalnum() or c in "_-" else "_" for c in str(outlet_id))
     return POI_RAW_DIR / f"{safe}__{radius_m}.json"
@@ -152,9 +123,7 @@ def fetch_outlet_pois(
     return data
 
 
-# ---------------------------------------------------------------------------
 # Feature extraction
-# ---------------------------------------------------------------------------
 def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Great-circle distance in meters."""
     r = 6_371_000.0
@@ -166,13 +135,8 @@ def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def _classify_element(tags: dict[str, str], taxonomy: dict[str, str]) -> str | None:
-    """Cheap, deterministic classifier — first matching category wins.
-
-    We avoid re-parsing the Overpass filter; instead we rely on the dominant
-    tag of each element.  Order matches `taxonomy` insertion order so callers
-    can prioritize.
-    """
-    # Pre-compute simple checks. Mirrors the filters in `POI_CONFIG.poi_taxonomy`.
+    """Cheap, deterministic classifier — first matching category wins."""
+    # Pre-compute simple checks.
     am = tags.get("amenity", "")
     tour = tags.get("tourism", "")
     hwy = tags.get("highway", "")
@@ -206,7 +170,7 @@ def _classify_element(tags: dict[str, str], taxonomy: dict[str, str]) -> str | N
         return "sports"
     if shop:
         return "shop"
-    # Not in taxonomy — ignore (Overpass may return extras due to OR semantics).
+    # Ignore elements not in taxonomy.
     if any(c in taxonomy for c in {am, tour, hwy, rail, leisure}):
         return None
     return None
@@ -238,7 +202,7 @@ def _features_from_response(
         if cat is None:
             continue
         counts[cat] = counts.get(cat, 0) + 1
-        # Position: nodes have lat/lon directly; ways/relations expose `center`.
+        # Extract position depending on node type.
         elat = el.get("lat") or (el.get("center") or {}).get("lat")
         elon = el.get("lon") or (el.get("center") or {}).get("lon")
         if elat is not None and elon is not None:
@@ -257,9 +221,7 @@ def _features_from_response(
     return feats
 
 
-# ---------------------------------------------------------------------------
 # Top-level builder
-# ---------------------------------------------------------------------------
 def build_poi_features(
     outlets_df: pd.DataFrame | None = None,
     radii: list[int] | None = None,
@@ -267,16 +229,7 @@ def build_poi_features(
     refresh: bool = False,
     limit: int | None = None,
 ) -> pd.DataFrame:
-    """Run scraping over all outlets and return a wide POI feature table.
-
-    Args:
-        outlets_df: must contain `outlet_id`, `latitude`, `longitude`.
-                    If None, reads ``data/silver/outlets.parquet``.
-        radii: list of radii in meters. Defaults to POI_CONFIG radii.
-        taxonomy: category->Overpass-filter mapping. Defaults to POI_CONFIG taxonomy.
-        refresh: ignore on-disk cache.
-        limit: optional cap for development runs.
-    """
+    """Run scraping over all outlets and return a wide POI feature table."""
     setup_logging()
     radii = radii or list(config.POI_CONFIG["radii_meters"])
     taxonomy = taxonomy or dict(config.POI_CONFIG["poi_taxonomy"])

@@ -1,26 +1,4 @@
-"""Silver Layer — Cleaning, Quarantine, and Enrichment Joins.
-
-Applies the DQ pipeline (from `src.processing.data_quality`) to each Bronze
-dataset, then:
-
-1. Writes clean rows to ``data/silver/<dataset>.parquet``
-2. Writes rejected rows to ``data/silver/_rejected/<dataset>__<run_id>.parquet``
-   with a `failure_reason` column.
-3. Writes a per-dataset, per-check tally to ``data/silver/_summary.json``.
-
-Beyond pure cleaning we also perform Silver-stage enrichment that every
-downstream consumer needs:
-
-- Map categorical `seasonality_index` → numeric using `SEASONALITY_NUMERIC`.
-- Derive each outlet's primary `distributor_id` (from transactions) and
-  attach it to the outlet master.
-- Derive `province` from the distributor-ID prefix.
-- Join the coordinate file into the outlet master.
-
-Run as a script::
-
-    python -m src.processing.silver_cleaning
-"""
+"""Silver Layer — Cleaning, Quarantine, and Enrichment Joins."""
 
 from __future__ import annotations
 
@@ -39,15 +17,13 @@ from src.utils.io import read_parquet, setup_logging, write_parquet
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Per-dataset check pipelines (declarative — easy to extend)
-# ---------------------------------------------------------------------------
+# Per-dataset check pipelines
 def _outlets_pipeline() -> list[CheckSpec]:
     s = config.SCHEMAS["outlets"]
     return [
         CheckSpec("null", {"mandatory_cols": s.mandatory_cols}),
         CheckSpec("duplicate", {"keys": s.primary_key}),
-        # Normalize the dirty Outlet_Type / Outlet_Size string values.
+        # Normalize categorical string values.
         CheckSpec("text_normalize", {
             "col": "outlet_type",
             "mapping": config.OUTLET_TYPE_CANONICAL,
@@ -65,7 +41,7 @@ def _coordinates_pipeline() -> list[CheckSpec]:
     return [
         CheckSpec("null", {"mandatory_cols": s.mandatory_cols}),
         CheckSpec("duplicate", {"keys": s.primary_key}),
-        # Attempt auto-fix for lat/lon swaps BEFORE bounding-box rejection.
+        # Auto-fix lat/lon swaps.
         CheckSpec("coord_swap_fix", {
             "lat_col": "latitude",
             "lon_col": "longitude",
@@ -93,7 +69,7 @@ def _seasonality_pipeline() -> list[CheckSpec]:
         CheckSpec("duplicate", {"keys": s.primary_key}),
         CheckSpec("value_range", {"col": "month", "min_": 1, "max_": 12}),
         CheckSpec("value_range", {"col": "year", "min_": 2022, "max_": 2026}),
-        # `seasonality_index` is categorical — accept only the 3 known values.
+        # Validate seasonality categories.
         CheckSpec("format", {
             "col": "seasonality_index",
             "regex": "|".join(config.SEASONALITY_NUMERIC.keys()),
@@ -127,11 +103,7 @@ def _transactions_pipeline(outlets_df: pd.DataFrame) -> list[CheckSpec]:
         CheckSpec("negative_volume_tag", {"value_col": "volume_liters"}),
         # Reject exact duplicates on the natural composite key.
         CheckSpec("duplicate", {"keys": s.primary_key}),
-        # NOTE: low-volume-month and credit-cap fingerprints are applied at
-        # the MONTHLY-total grain inside `src/features/gold_enrichment.py`,
-        # not at the transaction-line grain. Applying them per-line produced
-        # huge false-positive rates (each line is a single SKU within a
-        # month, so per-line quantiles are uninformative).
+        # NOTE: Monthly-total level checks are applied in gold_enrichment.
     ]
 
 
@@ -158,9 +130,7 @@ def _adjust_pipeline_to_columns(
     return keep
 
 
-# ---------------------------------------------------------------------------
-# Silver enrichment (after per-dataset cleaning)
-# ---------------------------------------------------------------------------
+# Silver enrichment
 def _enrich_seasonality(seasonality: pd.DataFrame) -> pd.DataFrame:
     """Map categorical seasonality_index → numeric float index."""
     if seasonality.empty or "seasonality_index" not in seasonality.columns:
@@ -190,8 +160,7 @@ def _enrich_outlets(
         )
 
     if not transactions.empty and "distributor_id" in transactions.columns:
-        # Each outlet's transactions are confined to one distributor (verified
-        # in EDA). Pick the most-frequent one defensively in case of stragglers.
+        # Get most-frequent distributor per outlet.
         per_outlet_dist = (
             transactions.groupby("outlet_id")["distributor_id"]
             .agg(lambda s: s.value_counts().index[0])
@@ -216,9 +185,7 @@ def _distributor_to_province(dist_id: str | float) -> str | float:
     return np.nan
 
 
-# ---------------------------------------------------------------------------
 # Runner
-# ---------------------------------------------------------------------------
 def _process_one(
     name: str,
     pipeline: list[CheckSpec],

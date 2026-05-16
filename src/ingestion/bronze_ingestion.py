@@ -1,16 +1,4 @@
-"""Bronze Layer — Raw Ingestion.
-
-Reads the supplied flat files (CSV) **as-is** with no transformations beyond
-canonical column renaming (which is purely cosmetic and reversible), then
-persists them as parquet inside ``data/bronze/`` for fast downstream access.
-
-A manifest (``data/bronze/_manifest.json``) records row counts, column lists,
-and SHA-256 hashes of the source files for full auditability.
-
-Run as a script::
-
-    python -m src.ingestion.bronze_ingestion
-"""
+"""Bronze Layer — Raw Ingestion."""
 
 from __future__ import annotations
 
@@ -46,7 +34,7 @@ def _ingest_one(name: str, source_csv: Path, out_dir: Path) -> dict:
     raw_df = read_csv_resilient(source_csv)
     original_cols = list(raw_df.columns)
 
-    # Only normalize column names. Values are untouched — Bronze is raw.
+    # Normalize column names only.
     df = normalize_columns(raw_df)
 
     out_path = out_dir / f"{name}.parquet"

@@ -1,9 +1,4 @@
-"""I/O helpers used across every layer of the pipeline.
-
-- Parquet preferred for intermediate storage (fast + typed).
-- Column-name normalization centralized here so the rest of the code can
-  reference canonical names regardless of how the raw CSV phrased them.
-"""
+"""I/O helpers used across every layer of the pipeline."""
 
 from __future__ import annotations
 
@@ -19,11 +14,8 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
 # Column-name normalization
-# ---------------------------------------------------------------------------
-# Maps a wide range of plausible raw column names to the canonical names used
-# by SCHEMAS in src/config.py. Extend freely as you encounter new aliases.
+# Maps plausible raw column names to the canonical names.
 CANONICAL_ALIASES: dict[str, list[str]] = {
     "outlet_id":     ["outlet_id", "outletid", "store_id", "shop_id", "retailer_id"],
     "distributor_id": ["distributor_id", "distributorid", "dist_id", "distributor"],
@@ -55,11 +47,7 @@ def _slug(name: str) -> str:
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Rename columns to canonical names using `CANONICAL_ALIASES`.
-
-    Unknown columns are kept as-is but slugged (lowercased, snake_cased) so the
-    DataFrame remains addressable by simple strings.
-    """
+    """Rename columns to canonical names using `CANONICAL_ALIASES`."""
     # First, slug every column
     df = df.rename(columns=lambda c: _slug(str(c)))
 
@@ -72,9 +60,7 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ---------------------------------------------------------------------------
 # Parquet / CSV helpers
-# ---------------------------------------------------------------------------
 def write_parquet(df: pd.DataFrame, path: Path) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -107,9 +93,7 @@ def read_csv_resilient(path: Path) -> pd.DataFrame:
     raise UnicodeDecodeError(f"Could not decode {path} with utf-8/latin-1")
 
 
-# ---------------------------------------------------------------------------
-# Manifest helpers (auditability)
-# ---------------------------------------------------------------------------
+# Manifest helpers
 def file_sha256(path: Path, chunk: int = 1 << 20) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -125,9 +109,7 @@ def write_manifest(path: Path, payload: dict) -> Path:
     return path
 
 
-# ---------------------------------------------------------------------------
 # Logging setup
-# ---------------------------------------------------------------------------
 def setup_logging(level: int = logging.INFO) -> None:
     if logging.getLogger().handlers:
         return
