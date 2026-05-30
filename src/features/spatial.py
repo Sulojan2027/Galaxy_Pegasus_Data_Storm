@@ -168,6 +168,13 @@ def compute_spatial_multiplier(
     z_acc = _robust_z(np.log1p(accessibility.clip(lower=0)))
     z_sat = _robust_z(np.log1p(saturation.clip(lower=0)))
     raw = cfg["access_beta"] * z_acc - cfg["sat_beta"] * z_sat
+    # Recenter on the median so the multiplier is a *relative* adjustment around
+    # the typical outlet: the median outlet gets exactly 1.0, accessibility above
+    # / saturation below the median lift it, the reverse discounts it. Without
+    # this, the median of (access_beta*z_acc - sat_beta*z_sat) is not zero (the
+    # median of a difference != difference of medians), so the factor acts as a
+    # systematic inflator rather than a centered adjustment.
+    raw = raw - raw.median()
     mult = (1.0 + raw).clip(lower=cfg["clamp_min"], upper=cfg["clamp_max"])
     return mult.rename("spatial_multiplier")
 
