@@ -144,7 +144,7 @@ The Round-1 three-estimator ensemble (peer ceiling + τ=0.90 quantile regression
 `ensemble_potential`, as an **independent** cross-check on the transparent model.
 
 **Read the cross-check on rank, not level.** The headline robustness signal is
-the **Spearman rank correlation ρ ≈ 0.90** between `mult_potential` and
+the **Spearman rank correlation ρ = 0.89** between `mult_potential` and
 `ensemble_potential`: two methods built on different principles order the 20k
 outlets' potential near-identically. That is the agreement that matters for a
 relative-ranking deliverable.

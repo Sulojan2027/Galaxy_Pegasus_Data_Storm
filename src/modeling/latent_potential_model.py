@@ -282,7 +282,7 @@ def compute_divergence(mult: pd.Series, ensemble: pd.Series) -> pd.Series:
 
     Interpretation — read the cross-check on RANK, not LEVEL:
 
-    - The robustness signal is the **Spearman rank correlation (ρ ≈ 0.90)**
+    - The robustness signal is the **Spearman rank correlation (ρ = 0.89)**
       between ``mult_potential`` and ``ensemble_potential``: two independently
       constructed methods rank the outlets' potential near-identically.
     - The two differ in LEVEL by design (median |divergence| ≈ 93%, i.e.
