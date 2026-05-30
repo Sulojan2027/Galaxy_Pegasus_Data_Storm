@@ -105,22 +105,46 @@ Built-in checks:
 | `distributor_blackout`   | **(custom)** day-wide zero-volume blackout per distributor |
 | `credit_cap_signature`   | **(custom, tag-only)** flag credit-limit fingerprints     |
 
-## Modeling — triangulation
+## Modeling — transparent multiplicative model (PRIMARY)
 
-We do **not** regress on the censored target. Instead we ensemble three
-independently-failing estimators:
+We do **not** regress on the censored target, and we deliberately avoid a black
+box so each factor's contribution can be read directly (XAI without
+SHAP-on-a-blackbox). The headline prediction is a product of four interpretable,
+stored factors:
 
-1. **Peer ceiling** — KMeans peer-cluster on POI + geo + scale; outlet
-   potential = seasonality-adjusted high-quantile of cluster's
-   *unconstrained* months × within-cluster size ratio.
-2. **Quantile regression** — τ=0.90 quantile regression on outlet
-   features (sklearn `QuantileRegressor`, with GBR fallback).
-3. **Unconstrained extrapolation** — for outlets with ≥2 unconstrained
-   months, use the deflated max of those months × the January 2026
-   distributor seasonality index.
+```
+potential = peer_ceiling × constraint_uplift × seasonality_index × spatial_multiplier
+```
 
-The final number is a per-row weight-renormalized blend with a sanity floor
-at historical max. See `src/config.py:MODEL_CONFIG` to tune.
+| Factor | Meaning | Where computed |
+|---|---|---|
+| `peer_ceiling` | Base: KMeans peer-cluster high-quantile of unconstrained months × within-cluster size ratio | `latent_potential_model.estimate_peer_ceiling` |
+| `constraint_uplift` | ≥ 1.0; how left-censored the outlet is (gap between unconstrained-deflated and typical observed, × constrained fraction) | `gold_enrichment.compute_constraint_uplift` |
+| `seasonality_index` | Standalone January distributor seasonality multiplier | `gold_enrichment.compute_seasonality_jan_index` |
+| `spatial_multiplier` | Bounded [0.7, 1.4]: Huff gravity accessibility (lift) − competitive saturation (discount), centered at 1.0 | `spatial.compute_spatial_multiplier` |
+
+Floored at historical max, capped at peer-cluster max (anti-blow-up). Every
+factor is written per outlet to `data/gold/outlet_factors.parquet` — the XAI
+layer reads these directly. See `src/config.py` (`MODEL_CONFIG`,
+`POI_DECAY_CONFIG`, `SATURATION_CONFIG`, `SPATIAL_CONFIG`) to tune.
+
+### Spatial signals (Huff / gravity)
+
+- **Distance-decay accessibility** (`poi_scraper`): each POI contributes a
+  decayed weight `exp(-d²/2σ²)` with a **per-type σ** (hospital/tourism pull
+  far; bus halt is local). Replaces flat counts (counts retained for audit).
+- **Competitive saturation** (`spatial.py`): our own outlets within radius
+  (BallTree haversine) + OSM competitor shops → saturation index that
+  discounts crowded catchments and lifts isolated outlets.
+
+### Ensemble — demoted to a validation diagnostic
+
+The Round-1 three-estimator ensemble (peer ceiling + τ=0.90 quantile regression
++ unconstrained extrapolation) is still computed every run as
+`ensemble_potential`. We report per-outlet **% divergence** between the
+transparent model and the ensemble as a robustness cross-check ("agrees within
+X%") and a bug detector — outlets diverging beyond `divergence_flag_pct` are
+flagged in `outlet_factors.parquet`.
 
 ## Repository structure
 

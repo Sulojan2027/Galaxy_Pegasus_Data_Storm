@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from src import config
+from src.features.spatial import attach_spatial_factors
 from src.utils.io import read_parquet, setup_logging, write_parquet
 
 logger = logging.getLogger(__name__)
@@ -179,6 +180,95 @@ def build_outlet_features(
     return df
 
 
+# ---------------------------------------------------------------------------
+# Transparent-model factor columns (the XAI inputs)
+# ---------------------------------------------------------------------------
+# These three deterministic factors are computed once here and STORED on the
+# outlet feature table so the modeling layer and the narrative/XAI layer read
+# them directly rather than recomputing. (peer_ceiling, the 4th factor, is the
+# KMeans-based base and is produced in the modeling layer.)
+def compute_constraint_uplift(features: pd.DataFrame) -> pd.Series:
+    """Factor >= 1.0 capturing how left-censored an outlet is.
+
+    Derived purely from signals we already compute — no new data:
+
+      constrained_fraction = months_constrained / months_observed     (0..1)
+      gap_ratio            = unc_deflated_mean / hist_total_mean       (>=1)
+      constraint_uplift    = 1 + constrained_fraction * (gap_ratio - 1)
+
+    ``gap_ratio`` is the lift between what the outlet achieves in its
+    *unconstrained* (deflated) months and its *typical* observed level — i.e.
+    the size of the censoring it suffers. We multiply by how OFTEN it is
+    constrained, so an outlet that is rarely constrained, or whose unconstrained
+    months are no higher than typical, gets uplift ~1.0 (no adjustment).
+
+    Outlets with no unconstrained months (no direct gap evidence) inherit the
+    global-median gap_ratio, scaled by their own constrained fraction.
+    """
+    cfg = config.MODEL_CONFIG
+    df = features
+    n_obs = pd.to_numeric(df.get("months_observed"), errors="coerce")
+    n_con = pd.to_numeric(df.get("months_constrained"), errors="coerce")
+    constrained_fraction = (n_con / n_obs.replace(0, np.nan)).clip(0.0, 1.0)
+
+    unc = pd.to_numeric(df.get("unc_deflated_mean"), errors="coerce")
+    obs = pd.to_numeric(df.get("hist_total_mean"), errors="coerce")
+    gap_ratio = (unc / obs.replace(0, np.nan))
+    gap_ratio = gap_ratio.where(np.isfinite(gap_ratio))
+    gap_ratio = gap_ratio.clip(lower=1.0, upper=cfg["constraint_gap_cap"])
+
+    # Fallback for outlets lacking unconstrained evidence: global median gap.
+    global_gap = gap_ratio.median()
+    if not np.isfinite(global_gap):
+        global_gap = 1.0
+    gap_ratio = gap_ratio.fillna(global_gap)
+
+    uplift = 1.0 + constrained_fraction.fillna(0.0) * (gap_ratio - 1.0)
+    uplift = uplift.clip(lower=1.0, upper=cfg["constraint_uplift_cap"]).fillna(1.0)
+    return uplift.rename("constraint_uplift")
+
+
+def compute_seasonality_jan_index(
+    features: pd.DataFrame,
+    seasonality: pd.DataFrame,
+) -> pd.Series:
+    """Standalone January seasonality multiplier, per outlet (via distributor).
+
+    Pulled OUT of the estimators so it is a clean, decomposable factor. Jan 2026
+    is absent from the data, so we fall back to Jan ``SEASONALITY_FALLBACK_YEAR``.
+    """
+    out = pd.Series(1.0, index=features.index, name="seasonality_jan_index")
+    if seasonality.empty or "distributor_id" not in features.columns:
+        return out
+    s = seasonality.copy()
+    for c in ("seasonality_index", "month", "year"):
+        if c in s.columns:
+            s[c] = pd.to_numeric(s[c], errors="coerce")
+
+    target_m, target_y = config.TARGET_MONTH_INT, config.TARGET_MONTH_YEAR
+    jan = s[(s["month"] == target_m) & (s["year"] == target_y)] if "year" in s.columns else s[s["month"] == target_m]
+    if jan.empty and "year" in s.columns:
+        jan = s[(s["month"] == target_m) & (s["year"] == config.SEASONALITY_FALLBACK_YEAR)]
+    jan = jan[["distributor_id", "seasonality_index"]].drop_duplicates("distributor_id")
+    mapping = dict(zip(jan["distributor_id"], jan["seasonality_index"]))
+    mapped = features["distributor_id"].map(mapping)
+    return mapped.replace(0, np.nan).fillna(1.0).rename("seasonality_jan_index")
+
+
+def attach_factor_columns(
+    features: pd.DataFrame,
+    seasonality: pd.DataFrame,
+) -> pd.DataFrame:
+    """Attach the three deterministic transparent-model factors + spatial
+    intermediates to the outlet feature table."""
+    df = features.copy()
+    df["constraint_uplift"] = compute_constraint_uplift(df)
+    df["seasonality_jan_index"] = compute_seasonality_jan_index(df, seasonality)
+    df = attach_spatial_factors(df)   # adds poi_accessibility, saturation_index, spatial_multiplier
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Runner
 def run_gold_enrichment(
     silver_dir: Path | None = None,
@@ -199,6 +289,8 @@ def run_gold_enrichment(
     write_parquet(monthly, monthly_path)
 
     features = build_outlet_features(outlets, monthly, poi)
+    # Attach the transparent-model factor columns (XAI inputs) + spatial signals.
+    features = attach_factor_columns(features, seasonality)
     features_path = gold_dir / "outlet_features.parquet"
     write_parquet(features, features_path)
 

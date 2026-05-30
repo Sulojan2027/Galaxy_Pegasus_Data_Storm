@@ -178,6 +178,96 @@ POI_CONFIG: dict[str, Any] = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# Spatial distance-decay  (Huff / gravity model)
+# ---------------------------------------------------------------------------
+# We replace flat POI counts with a gravity-style accessibility score. Each POI
+# contributes a *decayed* weight as a function of its distance d (meters) from
+# the outlet, so a school 80 m away counts for far more than one 900 m away.
+#
+# Kernel options (per `SPATIAL_CONFIG["decay_kernel"]`):
+#   - "gaussian":     w(d) = exp(-d^2 / (2 * sigma^2))
+#   - "exponential":  w(d) = exp(-d / sigma)        (sigma interpreted as d0)
+#
+# `decay_sigma_m` is DELIBERATELY different per POI type: a hospital or tourist
+# attraction exerts pull over a much larger radius than a single bus halt. These
+# are the gravity model's distance-decay parameters β (one per destination type).
+#
+# `demand_weight` is the Huff "attractiveness" A_j of each POI type — how strongly
+# that destination type drives beverage footfall past a traditional outlet. A bus
+# stand or market generates far more impulse traffic than a courthouse.
+POI_DECAY_CONFIG: dict[str, Any] = {
+    "decay_sigma_m": {
+        "bus_stand":        150.0,   # very local — you buy a drink at the halt you stand at
+        "bus_station":      400.0,
+        "railway":          500.0,
+        "school":           300.0,
+        "university":       600.0,
+        "hospital":         800.0,   # regional draw — visitors travel to it
+        "place_of_worship": 300.0,
+        "tourism":         1000.0,   # widest catchment — destination traffic
+        "market":           500.0,
+        "government":       450.0,
+        "restaurant":       250.0,
+        "sports":           400.0,
+        "shop":             200.0,
+    },
+    "demand_weight": {
+        "bus_stand":        1.0,
+        "bus_station":      1.2,
+        "railway":          1.2,
+        "school":           1.1,
+        "university":       1.0,
+        "hospital":         0.9,
+        "place_of_worship": 0.7,
+        "tourism":          1.1,
+        "market":           1.3,
+        "government":       0.4,
+        "restaurant":       0.9,
+        "sports":           0.6,
+        "shop":             0.0,   # shops are COMPETITION, not demand — handled in saturation
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Competitive catchment / saturation
+# ---------------------------------------------------------------------------
+# Saturation index = how crowded an outlet's catchment is with other points that
+# would split the same demand. Two sources:
+#   1. our OWN network — count of our outlets within `own_radius_m` (from the
+#      coordinate file, computed via a BallTree haversine query).
+#   2. OSM "shop" POIs within the matching scraped radius (third-party competition).
+# A higher index ⇒ demand is shared across more sellers ⇒ this outlet's realistic
+# share of catchment potential is LOWER (discount). An isolated outlet (low index)
+# captures more of its catchment (lift).
+SATURATION_CONFIG: dict[str, Any] = {
+    "own_radius_m": 500.0,        # radius for counting our own competing outlets
+    "osm_shop_radius_m": 500,     # which scraped POI radius to read shop counts from
+    "osm_shop_weight": 0.5,       # weight of OSM shops vs own-network outlets
+}
+
+# ---------------------------------------------------------------------------
+# Spatial multiplier assembly  (component that adjusts the prediction)
+# ---------------------------------------------------------------------------
+# spatial_multiplier is centered at 1.0 and bounded, so it is a controlled
+# adjustment to the transparent model rather than a free variable that can blow
+# up a product of factors. It LIFTS high-accessibility / isolated outlets and
+# DISCOUNTS low-accessibility / saturated ones:
+#
+#   raw = access_beta * z(log access) - sat_beta * z(log saturation)
+#   spatial_multiplier = clip(1.0 + raw, clamp_min, clamp_max)
+#
+# where z() is a robust (median / IQR) standardization across all outlets so the
+# multiplier is centered at 1.0 by construction.
+SPATIAL_CONFIG: dict[str, Any] = {
+    "decay_kernel": "gaussian",   # "gaussian" | "exponential"
+    "access_beta": 0.18,          # sensitivity to accessibility
+    "sat_beta": 0.15,             # sensitivity to saturation
+    "clamp_min": 0.70,
+    "clamp_max": 1.40,
+}
+
+# ---------------------------------------------------------------------------
 # Modeling
 MODEL_CONFIG: dict[str, Any] = {
     "peer_cluster_count": 25,
@@ -190,4 +280,25 @@ MODEL_CONFIG: dict[str, Any] = {
     },
     "min_unconstrained_months": 2,
     "potential_floor_multiplier": 1.0,
+
+    # --- Transparent multiplicative model ---
+    # Final = peer_ceiling * constraint_uplift * seasonality_index * spatial_multiplier
+    # constraint_uplift >= 1.0 (1.0 = unconstrained; higher = more suppressed).
+    "constraint_gap_cap": 2.0,      # cap on (unconstrained / observed) ratio
+    "constraint_uplift_cap": 1.60,  # hard ceiling on the uplift factor
+    "cap_at_peer_cluster_max": True,  # never exceed the outlet's peer-cluster max
+    # Divergence above this (|mult - ensemble| / ensemble) is flagged as a
+    # possible defect in the transparent model and surfaced in the report.
+    "divergence_flag_pct": 50.0,
+}
+
+# Budget optimization (Western Province incremental-volume allocation).
+# lift_i(s) = headroom_i * (1 - exp(-k * s)); greedy marginal allocation.
+BUDGET_CONFIG: dict[str, Any] = {
+    "total_budget_lkr": 5_000_000.0,
+    "target_province": "Western",
+    "response_k": 5e-6,             # diminishing-returns curvature (per LKR)
+    "step_lkr": 5_000.0,            # lumpy merchandising increment (greedy step)
+    "cooler_cost_lkr": 50_000.0,    # integer cooler unit cost (discrete constraint)
+    "max_spend_per_outlet_lkr": 250_000.0,
 }
