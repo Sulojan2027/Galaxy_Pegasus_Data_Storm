@@ -91,6 +91,50 @@ deliverable in the brief and is updated in real time as work progresses.
 ### Phase G — Reporting
 - _to be filled as work progresses._
 
+### Phase H — Final round: spatial decay, saturation, transparent model
+- **Used Claude (Claude Code)** to implement the Round-2 additions on top of the
+  existing lakehouse. The human-authored instruction set the architecture and the
+  guardrails; the AI wrote the code to that spec. Key prompt (paraphrased):
+  > "Make the transparent multiplicative model the PRIMARY output, built by
+  > re-expressing components we already trust. peer_ceiling stays the base;
+  > derive constraint_uplift (≥1.0) from the gap between constrained observed
+  > volume and unconstrained-deflated stats; pull Jan seasonality OUT into a
+  > standalone multiplier; spatial_multiplier = decay-accessibility + saturation,
+  > centered at 1.0 and clamped [0.7, 1.4]. Final = peer_ceiling *
+  > constraint_uplift * seasonality_index * spatial_multiplier, floored at
+  > historical max, capped at peer-cluster max. KEEP the 3-estimator ensemble but
+  > DEMOTE it to a validation diagnostic; output per-outlet % divergence as a
+  > robustness cross-check and bug detector. Store every factor per outlet for XAI."
+- **What the AI built, and the human decisions baked in:**
+  - **① Spatial distance-decay (Huff/gravity).** `poi_scraper._features_from_response`
+    now emits `poi_access_<cat>_<r>m` = Σ decay-weight, alongside the Round-1
+    counts (counts preserved — no regression). Decay scales are **different per
+    POI type** (`POI_DECAY_CONFIG.decay_sigma_m`): hospital σ=800 m and tourism
+    σ=1000 m pull far; a bus halt σ=150 m is local. Gaussian kernel by default,
+    exponential available. These are the gravity model's per-destination β.
+  - **② Competitive saturation.** New `src/features/spatial.py`. Own-network
+    density via a BallTree haversine query over the coordinate file + OSM shop
+    counts (OSM `shop` is competition, so its `demand_weight` is 0 in
+    accessibility and it feeds saturation instead). Saturation **adjusts the
+    prediction**: it is one of the two inputs to `spatial_multiplier`, which
+    discounts saturated clusters and lifts isolated/high-accessibility outlets.
+  - **④ Transparent multiplicative model.** `latent_potential_model.estimate_multiplicative`
+    multiplies the four stored factors, floors at `hist_total_max`, caps at
+    peer-cluster max × uplift cap. The 3-estimator ensemble is retained and run
+    every time as `ensemble_potential`; `compute_divergence` reports per-outlet
+    `divergence_pct`. Factors are written to `data/gold/outlet_factors.parquet`
+    as the XAI input — the narrative layer reads them, never recomputes.
+- **Guardrails the human required, AI implemented:** hard clamp on
+  `spatial_multiplier` ([0.7, 1.4]); explicit NaN/negative assertion on the final
+  prediction (raises, never ships silently); peer-cluster-max cap so a product of
+  factors cannot blow up; divergence distribution logged and flagged above 50%.
+- **No new magic numbers:** all decay scales, radii, betas, clamp bounds, caps,
+  and the budget response `k` live in `src/config.py`.
+- **AI suggestion rejected:** computing accessibility per-radius and feeding both
+  500 m and 1000 m into the model — redundant, since the decay kernel already
+  handles falloff within the widest radius. We emit both columns for audit but the
+  model reads only the widest-radius accessibility.
+
 ---
 
 ## What we explicitly did NOT accept from AI

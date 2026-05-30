@@ -134,6 +134,28 @@ def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * r * math.asin(math.sqrt(a))
 
 
+def _decay_weight(d: float, sigma: float, kernel: str) -> float:
+    """Distance-decay weight for one POI at distance ``d`` (meters).
+
+    This is the kernel of the Huff/gravity accessibility score. ``sigma`` is the
+    per-POI-type decay scale (a hospital's sigma is large, a bus halt's small),
+    so the same physical distance yields a different pull depending on the
+    destination type.
+
+        gaussian:     w(d) = exp(-d^2 / (2 * sigma^2))
+        exponential:  w(d) = exp(-d / sigma)
+
+    Both are 1.0 at d=0 and decay monotonically, so the resulting accessibility
+    is a bounded, interpretable [0, n] quantity rather than a raw count.
+    """
+    if sigma <= 0 or not math.isfinite(d):
+        return 0.0
+    if kernel == "exponential":
+        return math.exp(-d / sigma)
+    # default: gaussian
+    return math.exp(-(d * d) / (2.0 * sigma * sigma))
+
+
 def _classify_element(tags: dict[str, str], taxonomy: dict[str, str]) -> str | None:
     """Cheap, deterministic classifier — first matching category wins."""
     # Pre-compute simple checks.
@@ -188,11 +210,17 @@ def _features_from_response(
     categories = list(taxonomy.keys())
     counts = {c: 0 for c in categories}
     nearest = {c: float("inf") for c in categories}
+    # Huff/gravity accessibility: sum of distance-decayed weights per category.
+    access = {c: 0.0 for c in categories}
+
+    kernel = config.SPATIAL_CONFIG["decay_kernel"]
+    sigmas = config.POI_DECAY_CONFIG["decay_sigma_m"]
 
     if response is None:
         for c in categories:
             feats[f"poi_count_{c}_{radius_m}m"] = 0
             feats[f"poi_nearest_{c}_{radius_m}m"] = float("nan")
+            feats[f"poi_access_{c}_{radius_m}m"] = 0.0
         feats[f"poi_total_{radius_m}m"] = 0
         return feats
 
@@ -209,6 +237,8 @@ def _features_from_response(
             d = _haversine_m(lat, lon, elat, elon)
             if d < nearest[cat]:
                 nearest[cat] = d
+            # Gravity contribution under this type's own decay scale.
+            access[cat] += _decay_weight(d, sigmas.get(cat, 300.0), kernel)
 
     total = 0
     for c in categories:
@@ -216,6 +246,7 @@ def _features_from_response(
         feats[f"poi_nearest_{c}_{radius_m}m"] = (
             float("nan") if not math.isfinite(nearest[c]) else float(nearest[c])
         )
+        feats[f"poi_access_{c}_{radius_m}m"] = round(access[c], 6)
         total += counts[c]
     feats[f"poi_total_{radius_m}m"] = total
     return feats

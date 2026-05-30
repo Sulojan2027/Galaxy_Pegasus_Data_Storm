@@ -1,5 +1,6 @@
 # Ignore Data
 data/
+data-old/
 *.csv
 *.parquet
 
@@ -16,3 +17,5 @@ venv/
 # OS / editor
 .DS_Store
 *.swp
+
+.vscode/
