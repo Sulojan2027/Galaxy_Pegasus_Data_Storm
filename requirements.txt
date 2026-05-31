@@ -18,6 +18,11 @@ jupyter>=1.0
 matplotlib>=3.8
 seaborn>=0.13
 
+# Outlet Intelligence web app
+streamlit>=1.40
+altair>=5.0
+pydeck>=0.9
+
 # Utilities
 pyyaml>=6.0
 tqdm>=4.66

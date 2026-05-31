@@ -73,6 +73,31 @@ python -m src.modeling.latent_potential_model
 python -m src.optimization.budget_allocation   # Western trade-spend allocation
 ```
 
+## Outlet Intelligence web app
+
+A Streamlit app for business users to explore the model outputs. It reads the
+pipeline's parquet/CSV outputs directly — **run the pipeline first**, then:
+
+```bash
+pip install -r requirements.txt        # includes streamlit
+streamlit run app/streamlit_app.py
+# opens http://localhost:8501
+```
+
+The app provides:
+
+- **Browse & explore** — every outlet's Jan-2026 potential, with KPIs, a
+  potential histogram, a province breakdown, a geocoded outlet map, and a
+  sortable/downloadable table.
+- **Filters** — province and/or distributor (dependent), outlet type, and
+  Outlet_ID search (sidebar).
+- **Outlet drill-down** — pick any outlet and see *why* it scored what it did: a
+  factor-decomposition waterfall (`peer_ceiling → ×constraint_uplift →
+  ×seasonality → ×spatial_multiplier → floor/cap`) read straight from
+  `outlet_factors.parquet`, plus spatial drivers, the ensemble robustness
+  cross-check, and any recommended trade spend.
+- **Budget allocation** — the Western-Province spend plan and distributor roll-up.
+
 ## Notebooks
 
 All exploratory work lives in `notebooks/`, executed in order:
@@ -209,13 +234,16 @@ incremental January-2026 volume (`src/optimization/budget_allocation.py`).
 ├── run_pipeline.py
 ├── data/                    # (untracked) all data lives here
 ├── notebooks/               # EDA + analytical pipelines
+├── app/
+│   └── streamlit_app.py     # Outlet Intelligence web app
 └── src/
     ├── config.py            # single source of truth for paths/schemas/params
     ├── utils/io.py
     ├── ingestion/
     ├── processing/
-    ├── features/
-    └── modeling/
+    ├── features/            # poi_scraper (decay), spatial (saturation), gold_enrichment
+    ├── modeling/            # transparent multiplicative model + ensemble diagnostic
+    └── optimization/        # Western-Province budget allocation
 ```
 
 ## Notes on raw-data assumptions

@@ -159,6 +159,24 @@ deliverable in the brief and is updated in real time as work progresses.
   data — documented in README and config so the pitch doesn't over-claim a volume
   number that is really a function of an un-calibrated elasticity.
 
+### Phase J — Final round: Outlet Intelligence web app
+- **Used Claude (Claude Code)** to build the Streamlit app (`app/streamlit_app.py`)
+  over the existing pipeline outputs. Prompt (paraphrased): "Build the web app —
+  browse outlet predictions, filter by distributor/province, and drill into an
+  outlet to show its predicted potential AND the reasoning. Reuse the stored
+  factor columns; don't recompute."
+- **Design decision:** the drill-down "reasoning" is a **factor-decomposition
+  waterfall** (`peer_ceiling → ×constraint_uplift → ×seasonality → ×spatial →
+  floor/cap`) read directly from `outlet_factors.parquet`. This is only possible
+  because the primary model is transparent and multiplicative — the app is the
+  payoff of that architecture choice (XAI with no SHAP / no surrogate model).
+- **Validation:** ran Streamlit's headless `AppTest` harness to confirm the script
+  executes with no exceptions and that the outlet-selection interaction works,
+  before trusting it. Replaced the deprecated `use_container_width` API.
+- **Stack rationale (human call):** Streamlit chosen over a JS SPA — it reads our
+  parquet/CSV outputs natively, so the app is a thin read-only view with zero data
+  duplication, and is runnable with a single `streamlit run` command.
+
 ## What we explicitly did NOT accept from AI
 
 1. **Imputing missing volume with the mean.** Suggested early; rejected
