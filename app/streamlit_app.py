@@ -19,10 +19,15 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
 import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
+
+from llm_explainer import generate_outlet_explanation
 
 # Make ``src`` importable when launched via ``streamlit run`` from repo root.
 ROOT = Path(__file__).resolve().parents[1]
@@ -99,6 +104,22 @@ df = load_master()
 # Sidebar filters
 # ---------------------------------------------------------------------------
 st.sidebar.header("Filters")
+
+# --- AI explainability key (optional) ---
+with st.sidebar.expander("🤖 AI Explanations (optional)", expanded=False):
+    _env_key = __import__("os").environ.get("GROQ_API_KEY", "")
+    try:
+        _secret_key = st.secrets.get("GROQ_API_KEY", "")
+    except Exception:
+        _secret_key = ""
+    _default_key = _env_key or _secret_key
+    groq_api_key = st.text_input(
+        "Groq API key",
+        value=_default_key,
+        type="password",
+        help="Get a free key at console.groq.com. Used only to generate outlet narratives.",
+    )
+
 
 provinces = sorted(df["province"].dropna().unique().tolist()) if "province" in df else []
 sel_prov = st.sidebar.multiselect("Province", provinces, default=provinces)
@@ -308,6 +329,28 @@ with tab_outlet:
             b1.metric("Allocation (LKR)", _fmt(row["Trade_Spend_Allocation_LKR"]))
             b2.metric("Headroom (L)", _fmt(row.get("headroom")))
             b3.metric("Expected incremental (L)", _fmt(row.get("expected_incremental_liters")))
+
+        # ----- AI explanation -----
+        st.markdown("---")
+        st.markdown("#### 🤖 AI Explanation")
+        if not groq_api_key:
+            st.caption(
+                "Add a Groq API key in the sidebar to generate a plain-English "
+                "explanation of this outlet's score."
+            )
+        else:
+            cache_key = f"ai_explanation_{oid}"
+            if st.button("Generate explanation", key=f"btn_{oid}"):
+                with st.spinner("Generating explanation…"):
+                    explanation = generate_outlet_explanation(
+                        dict(row), api_key=groq_api_key
+                    )
+                st.session_state[cache_key] = explanation
+
+            cached = st.session_state.get(cache_key)
+            if cached:
+                st.info(cached)
+                st.caption("Powered by Groq · llama-3.3-70b-versatile")
 
 # ===========================================================================
 # TAB 3 — Budget allocation

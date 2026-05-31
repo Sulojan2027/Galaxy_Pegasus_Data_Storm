@@ -23,6 +23,10 @@ streamlit>=1.40
 altair>=5.0
 pydeck>=0.9
 
+# LLM explainability
+groq>=0.9
+python-dotenv>=1.0
+
 # Utilities
 pyyaml>=6.0
 tqdm>=4.66
