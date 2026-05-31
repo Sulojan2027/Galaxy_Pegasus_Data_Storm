@@ -12,6 +12,7 @@ from src.features.gold_enrichment import run_gold_enrichment
 from src.features.poi_scraper import build_poi_features
 from src.ingestion.bronze_ingestion import run_bronze_ingestion
 from src.modeling.latent_potential_model import run_modeling
+from src.optimization.budget_allocation import run_budget_optimization
 from src.processing.silver_cleaning import run_silver_cleaning
 from src.utils.io import setup_logging
 
@@ -36,31 +37,40 @@ def main() -> int:
     logger.info("project root: %s", config.PROJECT_ROOT)
     logger.info("=" * 60)
 
-    logger.info("[1/5] Bronze ingestion")
+    logger.info("[1/6] Bronze ingestion")
     run_bronze_ingestion()
 
-    logger.info("[2/5] Silver cleaning + DQ")
+    logger.info("[2/6] Silver cleaning + DQ")
     run_silver_cleaning()
 
     if args.skip_poi:
         cache = config.POI_CACHE_DIR / "poi_features.parquet"
         if cache.exists():
-            logger.info("[3/5] POI scraping skipped — using cache %s", cache)
+            logger.info("[3/6] POI scraping skipped — using cache %s", cache)
         else:
-            logger.warning("[3/5] POI scraping skipped but no cache exists — POI features will be empty")
+            logger.warning("[3/6] POI scraping skipped but no cache exists — POI features will be empty")
     else:
-        logger.info("[3/5] POI scraping")
+        logger.info("[3/6] POI scraping")
         build_poi_features(refresh=args.refresh_poi, limit=args.poi_limit)
 
-    logger.info("[4/5] Gold enrichment")
+    logger.info("[4/6] Gold enrichment")
     run_gold_enrichment()
 
-    logger.info("[5/5] Modeling")
+    logger.info("[5/6] Modeling")
     result = run_modeling(team_name=args.team)
+
+    logger.info("[6/6] Budget optimization (Western Province trade spend)")
+    budget = run_budget_optimization(team_name=args.team)
 
     logger.info("=" * 60)
     logger.info("Pipeline complete | predictions -> %s", result["predictions_csv"])
     logger.info("Method coverage: %s", result["coverage"])
+    logger.info("Budget allocation -> %s", budget["allocations_csv"])
+    logger.info(
+        "  funded %d/%d Western outlets, %.0f LKR -> +%.0f L",
+        budget["n_outlets_funded"], budget["n_outlets_total"],
+        budget["allocated_lkr"], budget["total_incremental_liters"],
+    )
     logger.info("=" * 60)
     return 0
 
