@@ -214,9 +214,22 @@ with tab_browse:
             "Trade_Spend_Allocation_LKR",
         ] if c in fdf.columns
     ]
-    st.dataframe(
-        fdf[show_cols].sort_values("mult_potential", ascending=False),
-        width="stretch", hide_index=True,
+    display_df = fdf[show_cols].sort_values("mult_potential", ascending=False).copy()
+    if "Trade_Spend_Allocation_LKR" in display_df.columns:
+        def _alloc_label(row: pd.Series) -> str:
+            v = row["Trade_Spend_Allocation_LKR"]
+            if pd.isna(v):
+                return "N/A (non-Western)"
+            if v == 0:
+                return "0 — not selected"
+            return f"LKR {v:,.0f}"
+        display_df["Allocation (LKR)"] = display_df.apply(_alloc_label, axis=1)
+        display_df = display_df.drop(columns=["Trade_Spend_Allocation_LKR"])
+    st.dataframe(display_df, width="stretch", hide_index=True)
+    st.caption(
+        "Allocation column: **LKR X** = funded outlet · "
+        "**0 — not selected** = Western Province but outranked by the 238 optimal outlets · "
+        "**N/A** = outside Western Province (budget is Western-only)"
     )
     st.download_button(
         "⬇ Download filtered table (CSV)",
@@ -323,10 +336,21 @@ with tab_outlet:
                            "inspect this outlet's inputs.")
 
         # ----- Budget allocation (if any) -----
-        if pd.notna(row.get("Trade_Spend_Allocation_LKR")) and row.get("Trade_Spend_Allocation_LKR", 0) > 0:
-            st.markdown("#### Recommended trade spend")
+        st.markdown("#### Recommended trade spend")
+        _alloc_val = row.get("Trade_Spend_Allocation_LKR")
+        if pd.isna(_alloc_val):
+            st.caption(
+                "No allocation — this outlet is outside Western Province. "
+                "The LKR 5,000,000 budget covers Western Province only."
+            )
+        elif _alloc_val == 0:
+            st.caption(
+                "Not selected by the optimizer — this Western Province outlet was evaluated "
+                "but outranked by the 238 outlets with higher marginal lift per rupee."
+            )
+        else:
             b1, b2, b3 = st.columns(3)
-            b1.metric("Allocation (LKR)", _fmt(row["Trade_Spend_Allocation_LKR"]))
+            b1.metric("Allocation (LKR)", _fmt(_alloc_val))
             b2.metric("Headroom (L)", _fmt(row.get("headroom")))
             b3.metric("Expected incremental (L)", _fmt(row.get("expected_incremental_liters")))
 
