@@ -137,6 +137,28 @@ deliverable in the brief and is updated in real time as work progresses.
 
 ---
 
+### Phase I — Final round: marketing spend optimization
+- **Used Claude (Claude Code)** to implement the Western-Province budget allocator
+  (`src/optimization/budget_allocation.py`) to the brief §2.3 spec. Human-set
+  design; AI wrote it. Prompt (paraphrased):
+  > "Allocate a fixed LKR 5M across Western outlets to maximize incremental volume
+  > vs normal historical sales. Use the concave response lift_i(s) =
+  > headroom_i*(1-exp(-k*s)) with headroom_i = potential_i - historical_i. Because
+  > the objective is concave, use greedy marginal allocation — it's optimal and
+  > explainable. Add discrete real-world constraints (cooler = integer,
+  > merchandising = lumpy)."
+- **Design decisions baked in:** `potential_i` = transparent-model `mult_potential`;
+  `historical_i` = `hist_total_median` (robust "normal monthly" baseline); greedy
+  via a max-heap on marginal lift; discrete lumpy `step_lkr` increments with an
+  integer-cooler block (`cooler_cost_lkr` = 10 steps) and a per-outlet cap.
+- **Math we asked AI to justify, then verified:** that greedy is *globally optimal*
+  (not just a heuristic) for a concave, separable objective over this constraint
+  set, and that ranking by marginal lift reduces to ranking by
+  `headroom_i*exp(-k*s_i)` because the per-step factor is constant across outlets.
+- **Honesty flag we insisted on:** `k` is a business assumption, not fitted from
+  data — documented in README and config so the pitch doesn't over-claim a volume
+  number that is really a function of an un-calibrated elasticity.
+
 ## What we explicitly did NOT accept from AI
 
 1. **Imputing missing volume with the mean.** Suggested early; rejected

@@ -56,8 +56,11 @@ python run_pipeline.py --poi-limit 100         # only scrape 100 outlets
 python run_pipeline.py --refresh-poi           # ignore cache, re-scrape
 ```
 
-Output is written to `data/predictions/galaxy_pegasus_predictions.csv`
-with columns `Outlet_ID, Maximum_Monthly_Liters`.
+Outputs written to `data/predictions/`:
+
+- `galaxy_pegasus_predictions.csv` — `Outlet_ID, Maximum_Monthly_Liters` (deliverable 1)
+- `galaxy_pegasus_budget_allocations.csv` — `Outlet_ID, Trade_Spend_Allocation_LKR` (deliverable 2)
+- `budget_allocation_by_distributor.csv` — Western-Province distributor roll-up
 
 ## Running individual stages
 
@@ -67,6 +70,7 @@ python -m src.processing.silver_cleaning
 python -m src.features.poi_scraper
 python -m src.features.gold_enrichment
 python -m src.modeling.latent_potential_model
+python -m src.optimization.budget_allocation   # Western trade-spend allocation
 ```
 
 ## Notebooks
@@ -167,6 +171,33 @@ testing). `divergence_flag` (|divergence| > `divergence_flag_pct`) is retained
 purely as a **per-outlet defect detector**: it surfaces individual outlets where
 the transparent factor product disagrees with the ensemble far more than the
 ~2× structural offset, which usually means a bad input for that outlet.
+
+## Marketing spend optimization (Western Province)
+
+Allocates a fixed **LKR 5,000,000** across Western-Province outlets to maximize
+incremental January-2026 volume (`src/optimization/budget_allocation.py`).
+
+- **Headroom:** `headroom_i = max(potential_i − historical_i, 0)`, where
+  `potential_i` is the transparent model's `mult_potential` and `historical_i`
+  is the outlet's normal monthly volume (`hist_total_median`).
+- **Response (diminishing returns):** `lift_i(s) = headroom_i · (1 − e^{−k·s})`.
+  Concave, asymptotes at headroom (you can't sell past true demand). `k` in
+  `BUDGET_CONFIG`.
+- **Greedy marginal allocation:** give each next lumpy increment to the outlet
+  with the highest marginal lift `headroom_i · e^{−k·s_i} · (1 − e^{−k·step})`.
+  For a concave, separable objective this is **provably optimal** — and fully
+  explainable (every rupee has a one-line marginal-value justification).
+- **Discrete constraints:** spend is lumpy (multiples of `step_lkr`); coolers are
+  integer (`cooler_cost_lkr` is a whole multiple of `step_lkr`); per-outlet cap
+  `max_spend_per_outlet_lkr`.
+- **Guardrails:** total ≤ budget, no negatives, every allocation a multiple of
+  the step (all asserted at runtime).
+
+> Note: `k` (LKR→volume conversion) is a business assumption in `BUDGET_CONFIG`,
+> not fitted from data. It scales the absolute incremental-volume figure and how
+> concentrated the allocation is; the *relative* ranking of where to spend is
+> robust to it. Calibrate `k` to the client's observed promo elasticity before
+> quoting headline volume in the pitch.
 
 ## Repository structure
 
